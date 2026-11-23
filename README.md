@@ -25,11 +25,11 @@ The service requires Python 3.14 and `uv` 0.13.9. Run `uv sync --locked --all-gr
 
 The domain and application layers do not import FastAPI, SQLAlchemy, JWT or Alembic. Application use cases depend only on authentication, persistence and migration ports and receive them through constructor injection. Concrete OIDC, SQLAlchemy and Alembic implementations are assembled only in `adapters/http.py`. Migration configuration and revisions remain under `adapters/migrations`, so a database adapter can be replaced without moving infrastructure into the core.
 
-`/v1/profile/items` exposes owner-scoped Experience and Education CRUD. Every request requires a validated OIDC bearer token and the appropriate `profile:read` or `profile:write` scope. Tenant and account identifiers come only from verified claims, and every database query applies both ownership dimensions. The cross-kind reader preserves one deterministic order and opaque cursor across supported item types. An absent item and an item owned by another account both return the same `404` problem response. Skill follows as the final additive V1-013 slice.
+`/v1/profile/items` exposes owner-scoped Experience, Education and Skill CRUD. Every request requires a validated OIDC bearer token and the appropriate `profile:read` or `profile:write` scope. Tenant and account identifiers come only from verified claims, and every database query applies both ownership dimensions. The cross-kind reader preserves one deterministic order and opaque cursor across all V1 item types. Skill levels are always returned with `levelSource: selfDeclared`; clients cannot claim certified provenance. An absent item and an item owned by another account both return the same `404` problem response.
 
 ## Status
 
-Python service with isolated persistence, startup-enforced reversible migrations, authenticated Experience and Education CRUD, and automated quality gates.
+Python service with isolated persistence, startup-enforced reversible migrations, authenticated V1 profile-item CRUD and automated quality gates.
 
 ## License
 

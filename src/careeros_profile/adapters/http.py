@@ -33,6 +33,7 @@ from careeros_profile.adapters.persistence.sqlalchemy import (
     SqlAlchemyExperienceRepository,
     SqlAlchemyPersistenceProbe,
     SqlAlchemyProfileItemReader,
+    SqlAlchemySkillRepository,
     create_profile_engine,
 )
 from careeros_profile.application.ports.authentication import (
@@ -46,6 +47,7 @@ from careeros_profile.application.ports.profile import (
     ExperienceRepository,
     ProfileItemReader,
     ProfileOwner,
+    SkillRepository,
 )
 from careeros_profile.application.use_cases.operations import (
     GetHealth,
@@ -179,6 +181,7 @@ def create_app(
     profile_item_reader: ProfileItemReader | None = None,
     experience_repository: ExperienceRepository | None = None,
     education_repository: EducationRepository | None = None,
+    skill_repository: SkillRepository | None = None,
 ) -> FastAPI:
     """Compose concrete adapters and inject ports into application use cases."""
     validated_settings = settings or Settings()
@@ -190,17 +193,19 @@ def create_app(
         or profile_item_reader is None
         or experience_repository is None
         or education_repository is None
+        or skill_repository is None
     ):
         engine = create_profile_engine(database_url)
     probe = persistence_probe or SqlAlchemyPersistenceProbe(cast(Engine, engine))
     reader = profile_item_reader or SqlAlchemyProfileItemReader(cast(Engine, engine))
     experiences = experience_repository or SqlAlchemyExperienceRepository(cast(Engine, engine))
     educations = education_repository or SqlAlchemyEducationRepository(cast(Engine, engine))
+    skills = skill_repository or SqlAlchemySkillRepository(cast(Engine, engine))
     migrations = migration_runner or AlembicMigrationRunner(database_url)
     get_health = GetHealth()
     get_readiness = GetReadiness(probe)
     start_application = StartApplication(migrations)
-    profile_items = ManageProfileItems(reader, experiences, educations)
+    profile_items = ManageProfileItems(reader, experiences, educations, skills)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:

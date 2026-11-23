@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict
 from careeros_profile.domain.education import Education, EducationDraft
 from careeros_profile.domain.experience import Experience, ExperienceDraft
 from careeros_profile.domain.profile_item import ProfileItem, ProfileItemKind
+from careeros_profile.domain.skill import Skill, SkillDraft
 
 
 class ProfileOwner(BaseModel):
@@ -63,6 +64,16 @@ class EducationRepository(Protocol):
     def replace(
         self, owner: ProfileOwner, item_id: UUID, draft: EducationDraft
     ) -> Education | None: ...
+
+    def delete(self, owner: ProfileOwner, item_id: UUID) -> bool: ...
+
+
+class SkillRepository(Protocol):
+    """Outbound port for owner-scoped skill mutations."""
+
+    def create(self, owner: ProfileOwner, draft: SkillDraft) -> Skill: ...
+
+    def replace(self, owner: ProfileOwner, item_id: UUID, draft: SkillDraft) -> Skill | None: ...
 
     def delete(self, owner: ProfileOwner, item_id: UUID) -> bool: ...
 
