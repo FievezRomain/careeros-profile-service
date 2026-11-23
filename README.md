@@ -23,11 +23,13 @@ The service requires Python 3.14 and `uv` 0.13.9. Run `uv sync --locked --all-gr
 
 `GET /health` reports process liveness. `GET /ready` verifies the owned database with a minimal query and returns `503` without connection details when unavailable. These are the only public endpoints in this scaffold, intentionally require no authentication and propagate `X-Correlation-ID` without logging query values.
 
-The domain and application layers do not import FastAPI, SQLAlchemy or Alembic. Application use cases depend only on persistence and migration ports and receive them through constructor injection. SQLAlchemy lives under `adapters/persistence`; the runner and its revision history live under `adapters/migrations`, so another database implementation can replace the technical adapter without moving infrastructure into the core. The initial `profiles` table stores only opaque identifiers and creation time. Profile CRUD and public business contracts are deferred to V1-013.
+The domain and application layers do not import FastAPI, SQLAlchemy, JWT or Alembic. Application use cases depend only on authentication, persistence and migration ports and receive them through constructor injection. Concrete OIDC, SQLAlchemy and Alembic implementations are assembled only in `adapters/http.py`. Migration configuration and revisions remain under `adapters/migrations`, so a database adapter can be replaced without moving infrastructure into the core.
+
+`/v1/profile/items` currently exposes the first V1-013 vertical slice: owner-scoped Experience CRUD. Every request requires a validated OIDC bearer token and the appropriate `profile:read` or `profile:write` scope. Tenant and account identifiers come only from verified claims, and every database query applies both ownership dimensions. An absent item and an item owned by another account both return the same `404` problem response. Education and Skill variants follow as additive slices of the same versioned contract.
 
 ## Status
 
-Python service scaffold with isolated persistence, reversible migrations and automated quality gates. Functional profile behavior will be added incrementally with tests and versioned contracts.
+Python service with isolated persistence, startup-enforced reversible migrations, authenticated Experience CRUD and automated quality gates.
 
 ## License
 

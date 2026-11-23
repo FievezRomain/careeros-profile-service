@@ -1,0 +1,3 @@
+[allowlist]
+description = "Reserved public placeholder domains used by synthetic test configuration"
+stopwords = ["example.invalid"]

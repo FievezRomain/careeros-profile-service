@@ -39,17 +39,24 @@ class StubMigrationRunner:
         return MigrationState(current_heads=current, expected_heads=("head",))
 
 
-SETTINGS = Settings(app_env="test", log_level="info", database_url="sqlite+pysqlite:///:memory:")
+SETTINGS = Settings(
+    app_env="test",
+    log_level="info",
+    database_url="sqlite+pysqlite:///:memory:",
+    oidc_issuer="https://identity.example.invalid/realms/careeros",
+    oidc_audience="careeros-api",
+    oidc_jwks_url="https://identity.example.invalid/realms/careeros/certs",
+)
 
 
 def client(ready: bool = True, migrations: StubMigrationRunner | None = None) -> TestClient:
     return TestClient(create_app(SETTINGS, StubProbe(ready), migrations or StubMigrationRunner()))
 
 
-def profile_table_exists(database_url: str) -> bool:
+def tables(database_url: str) -> set[str]:
     engine = create_engine(database_url)
     try:
-        return "profiles" in inspect(engine).get_table_names()
+        return set(inspect(engine).get_table_names())
     finally:
         engine.dispose()
 
@@ -122,18 +129,23 @@ def test_rejects_missing_or_invalid_configuration(values: dict[str, str]) -> Non
         Settings.model_validate(values)
 
 
-def test_openapi_documents_only_public_operational_endpoints() -> None:
+def test_openapi_documents_operational_and_versioned_profile_endpoints() -> None:
     with client() as test_client:
         document = test_client.get("/openapi.json").json()
 
-    assert set(document["paths"]) == {"/health", "/ready"}
+    assert set(document["paths"]) == {
+        "/health",
+        "/ready",
+        "/v1/profile/items",
+        "/v1/profile/items/{itemId}",
+    }
 
 
-def test_initial_migration_applies_and_rolls_back(tmp_path: Path) -> None:
+def test_migrations_apply_and_roll_back_all_adapter_owned_tables(tmp_path: Path) -> None:
     database_url = f"sqlite+pysqlite:///{tmp_path / 'migration.db'}"
     migrations = AlembicMigrationRunner(database_url)
 
     assert migrations.ensure_latest().at_latest
-    assert profile_table_exists(database_url)
+    assert {"alembic_version", "profiles", "experiences"} <= tables(database_url)
     migrations.downgrade_base()
-    assert not profile_table_exists(database_url)
+    assert not ({"profiles", "experiences"} & tables(database_url))
