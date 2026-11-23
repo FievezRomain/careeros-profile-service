@@ -31,7 +31,7 @@ OIDC verification is an inbound adapter behind the application-owned `TokenVerif
 
 - `GET /v1/profile/items` lists owned experiences with bounded cursor pagination.
 - `POST /v1/profile/items` creates a validated experience.
-- `GET`, `PUT` and `DELETE /v1/profile/items/{item_id}` operate only inside the authenticated ownership scope.
+- `GET`, `PUT` and `DELETE /v1/profile/items/{itemId}` operate only inside the authenticated ownership scope.
 - `profile:read` protects reads and `profile:write` protects mutations.
 - Authentication, authorization, validation and concealed ownership failures use stable problem responses without token or payload details.
 
