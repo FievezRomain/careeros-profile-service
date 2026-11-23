@@ -76,9 +76,9 @@ correlation = true
 redaction = true
 
 [tool.careeros.quality.evidence]
-unit = "tests/test_service.py"
-integration = "tests/test_service.py"
-contract = "tests/test_service.py"
+unit = "tests/test_profile_item_domain.py"
+integration = "tests/test_educations.py"
+contract = "tests/test_educations.py"
 health = "tests/test_service.py"
 logging = "tests/test_service.py"
 security = "tests/test_service.py"

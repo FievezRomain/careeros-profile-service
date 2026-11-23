@@ -9,6 +9,7 @@ from sqlalchemy import (
     DateTime,
     Engine,
     ForeignKey,
+    Select,
     String,
     create_engine,
     select,
@@ -18,11 +19,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from careeros_profile.application.ports.persistence import PersistenceHealth
-from careeros_profile.application.ports.profile import (
-    ExperienceSlice,
-    ProfileOwner,
-)
+from careeros_profile.application.ports.profile import ProfileItemSlice, ProfileOwner
+from careeros_profile.domain.education import Education, EducationDraft
 from careeros_profile.domain.experience import Experience, ExperienceDraft
+from careeros_profile.domain.profile_item import ProfileItem, ProfileItemKind
 
 
 class Base(DeclarativeBase):
@@ -43,7 +43,7 @@ class ProfileRow(Base):
 
 
 class ExperienceRow(Base):
-    """SQLAlchemy representation kept inside the persistence adapter."""
+    """SQLAlchemy representation of a professional experience."""
 
     __tablename__ = "experiences"
 
@@ -61,116 +61,237 @@ class ExperienceRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
-class SqlAlchemyExperienceRepository:
-    """Persist experiences while applying tenant and owner scope in every query."""
+class EducationRow(Base):
+    """SQLAlchemy representation of an education item."""
+
+    __tablename__ = "educations"
+
+    item_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("profiles.profile_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    institution: Mapped[str] = mapped_column(String(200), nullable=False)
+    qualification: Mapped[str] = mapped_column(String(200), nullable=False)
+    field_of_study: Mapped[str | None] = mapped_column(String(200))
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    end_date: Mapped[date | None] = mapped_column(Date)
+    current: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+def _owned_experiences(owner: ProfileOwner) -> Select[ExperienceRow]:
+    return (
+        select(ExperienceRow)
+        .join(ProfileRow, ExperienceRow.profile_id == ProfileRow.profile_id)
+        .where(
+            ProfileRow.tenant_id == str(owner.tenant_id),
+            ProfileRow.owner_account_id == str(owner.account_id),
+        )
+    )
+
+
+def _owned_educations(owner: ProfileOwner) -> Select[EducationRow]:
+    return (
+        select(EducationRow)
+        .join(ProfileRow, EducationRow.profile_id == ProfileRow.profile_id)
+        .where(
+            ProfileRow.tenant_id == str(owner.tenant_id),
+            ProfileRow.owner_account_id == str(owner.account_id),
+        )
+    )
+
+
+def _profile_id(session: Session, owner: ProfileOwner) -> str:
+    profile = session.scalar(
+        select(ProfileRow).where(
+            ProfileRow.tenant_id == str(owner.tenant_id),
+            ProfileRow.owner_account_id == str(owner.account_id),
+        )
+    )
+    if profile is None:
+        profile = ProfileRow(
+            profile_id=str(uuid4()),
+            tenant_id=str(owner.tenant_id),
+            owner_account_id=str(owner.account_id),
+        )
+        session.add(profile)
+        session.flush()
+    return profile.profile_id
+
+
+def _aware(value: datetime) -> datetime:
+    return value.replace(tzinfo=value.tzinfo or UTC)
+
+
+def _experience(row: ExperienceRow) -> Experience:
+    return Experience.model_validate(
+        {
+            "item_id": row.item_id,
+            "kind": "experience",
+            "title": row.title,
+            "employer": row.employer,
+            "description": row.description,
+            "start_date": row.start_date,
+            "end_date": row.end_date,
+            "current": row.current,
+            "created_at": _aware(row.created_at),
+            "updated_at": _aware(row.updated_at),
+        }
+    )
+
+
+def _education(row: EducationRow) -> Education:
+    return Education.model_validate(
+        {
+            "item_id": row.item_id,
+            "kind": "education",
+            "institution": row.institution,
+            "qualification": row.qualification,
+            "field_of_study": row.field_of_study,
+            "start_date": row.start_date,
+            "end_date": row.end_date,
+            "current": row.current,
+            "created_at": _aware(row.created_at),
+            "updated_at": _aware(row.updated_at),
+        }
+    )
+
+
+class SqlAlchemyProfileItemReader:
+    """Read all supported item kinds through one stable ordered page."""
 
     def __init__(self, engine: Engine) -> None:
         self._sessions = sessionmaker(engine, expire_on_commit=False)
 
-    def list(self, owner: ProfileOwner, *, offset: int, limit: int) -> ExperienceSlice:
+    def list(
+        self,
+        owner: ProfileOwner,
+        *,
+        offset: int,
+        limit: int,
+        kind: ProfileItemKind | None,
+    ) -> ProfileItemSlice:
+        ceiling = offset + limit + 1
         with self._sessions() as session:
-            statement = (
-                self._owned_query(owner)
-                .order_by(ExperienceRow.created_at, ExperienceRow.item_id)
-                .offset(offset)
-                .limit(limit + 1)
-            )
-            rows = tuple(session.scalars(statement))
-            return ExperienceSlice(
-                items=tuple(self._to_domain(row) for row in rows[:limit]),
-                has_more=len(rows) > limit,
-            )
+            items: list[ProfileItem] = []
+            if kind in (None, "experience"):
+                experience_rows = session.scalars(
+                    _owned_experiences(owner)
+                    .order_by(ExperienceRow.created_at, ExperienceRow.item_id)
+                    .limit(ceiling)
+                )
+                items.extend(_experience(row) for row in experience_rows)
+            if kind in (None, "education"):
+                education_rows = session.scalars(
+                    _owned_educations(owner)
+                    .order_by(EducationRow.created_at, EducationRow.item_id)
+                    .limit(ceiling)
+                )
+                items.extend(_education(row) for row in education_rows)
+        items.sort(key=lambda item: (item.created_at, str(item.item_id)))
+        window = items[offset : offset + limit + 1]
+        return ProfileItemSlice(items=tuple(window[:limit]), has_more=len(window) > limit)
 
-    def get(self, owner: ProfileOwner, item_id: UUID) -> Experience | None:
+    def get(self, owner: ProfileOwner, item_id: UUID) -> ProfileItem | None:
         with self._sessions() as session:
-            row = session.scalar(
-                self._owned_query(owner).where(ExperienceRow.item_id == str(item_id))
+            experience = session.scalar(
+                _owned_experiences(owner).where(ExperienceRow.item_id == str(item_id))
             )
-            return self._to_domain(row) if row is not None else None
+            if experience is not None:
+                return _experience(experience)
+            education = session.scalar(
+                _owned_educations(owner).where(EducationRow.item_id == str(item_id))
+            )
+            return _education(education) if education is not None else None
+
+
+class SqlAlchemyExperienceRepository:
+    """Persist experience mutations inside the trusted owner scope."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._sessions = sessionmaker(engine, expire_on_commit=False)
 
     def create(self, owner: ProfileOwner, draft: ExperienceDraft) -> Experience:
         with self._sessions.begin() as session:
             now = datetime.now(UTC)
             row = ExperienceRow(
                 item_id=str(uuid4()),
-                profile_id=self._profile_id(session, owner),
+                profile_id=_profile_id(session, owner),
                 created_at=now,
                 updated_at=now,
                 **draft.model_dump(exclude={"kind"}, by_alias=False),
             )
             session.add(row)
-        return self._to_domain(row)
+        return _experience(row)
 
     def replace(
         self, owner: ProfileOwner, item_id: UUID, draft: ExperienceDraft
     ) -> Experience | None:
         with self._sessions.begin() as session:
             row = session.scalar(
-                self._owned_query(owner).where(ExperienceRow.item_id == str(item_id))
+                _owned_experiences(owner).where(ExperienceRow.item_id == str(item_id))
             )
             if row is None:
                 return None
             for field, value in draft.model_dump(exclude={"kind"}, by_alias=False).items():
                 setattr(row, field, value)
             row.updated_at = datetime.now(UTC)
-        return self._to_domain(row)
+        return _experience(row)
 
     def delete(self, owner: ProfileOwner, item_id: UUID) -> bool:
         with self._sessions.begin() as session:
             row = session.scalar(
-                self._owned_query(owner).where(ExperienceRow.item_id == str(item_id))
+                _owned_experiences(owner).where(ExperienceRow.item_id == str(item_id))
             )
             if row is None:
                 return False
             session.delete(row)
             return True
 
-    @staticmethod
-    def _owned_query(owner: ProfileOwner):  # type: ignore[no-untyped-def]
-        return (
-            select(ExperienceRow)
-            .join(ProfileRow, ExperienceRow.profile_id == ProfileRow.profile_id)
-            .where(
-                ProfileRow.tenant_id == str(owner.tenant_id),
-                ProfileRow.owner_account_id == str(owner.account_id),
-            )
-        )
 
-    @staticmethod
-    def _profile_id(session: Session, owner: ProfileOwner) -> str:
-        statement = select(ProfileRow).where(
-            ProfileRow.tenant_id == str(owner.tenant_id),
-            ProfileRow.owner_account_id == str(owner.account_id),
-        )
-        profile = session.scalar(statement)
-        if profile is None:
-            profile = ProfileRow(
-                profile_id=str(uuid4()),
-                tenant_id=str(owner.tenant_id),
-                owner_account_id=str(owner.account_id),
-            )
-            session.add(profile)
-            session.flush()
-        return profile.profile_id
+class SqlAlchemyEducationRepository:
+    """Persist education mutations inside the trusted owner scope."""
 
-    @staticmethod
-    def _to_domain(row: ExperienceRow) -> Experience:
-        created_at = row.created_at.replace(tzinfo=row.created_at.tzinfo or UTC)
-        updated_at = row.updated_at.replace(tzinfo=row.updated_at.tzinfo or UTC)
-        return Experience.model_validate(
-            {
-                "item_id": row.item_id,
-                "kind": "experience",
-                "title": row.title,
-                "employer": row.employer,
-                "description": row.description,
-                "start_date": row.start_date,
-                "end_date": row.end_date,
-                "current": row.current,
-                "created_at": created_at,
-                "updated_at": updated_at,
-            }
-        )
+    def __init__(self, engine: Engine) -> None:
+        self._sessions = sessionmaker(engine, expire_on_commit=False)
+
+    def create(self, owner: ProfileOwner, draft: EducationDraft) -> Education:
+        with self._sessions.begin() as session:
+            now = datetime.now(UTC)
+            row = EducationRow(
+                item_id=str(uuid4()),
+                profile_id=_profile_id(session, owner),
+                created_at=now,
+                updated_at=now,
+                **draft.model_dump(exclude={"kind"}, by_alias=False),
+            )
+            session.add(row)
+        return _education(row)
+
+    def replace(
+        self, owner: ProfileOwner, item_id: UUID, draft: EducationDraft
+    ) -> Education | None:
+        with self._sessions.begin() as session:
+            row = session.scalar(
+                _owned_educations(owner).where(EducationRow.item_id == str(item_id))
+            )
+            if row is None:
+                return None
+            for field, value in draft.model_dump(exclude={"kind"}, by_alias=False).items():
+                setattr(row, field, value)
+            row.updated_at = datetime.now(UTC)
+        return _education(row)
+
+    def delete(self, owner: ProfileOwner, item_id: UUID) -> bool:
+        with self._sessions.begin() as session:
+            row = session.scalar(
+                _owned_educations(owner).where(EducationRow.item_id == str(item_id))
+            )
+            if row is None:
+                return False
+            session.delete(row)
+            return True
 
 
 class SqlAlchemyPersistenceProbe:
