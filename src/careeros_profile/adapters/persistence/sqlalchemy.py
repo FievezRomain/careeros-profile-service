@@ -23,6 +23,7 @@ from careeros_profile.application.ports.profile import ProfileItemSlice, Profile
 from careeros_profile.domain.education import Education, EducationDraft
 from careeros_profile.domain.experience import Experience, ExperienceDraft
 from careeros_profile.domain.profile_item import ProfileItem, ProfileItemKind
+from careeros_profile.domain.skill import Skill, SkillDraft
 
 
 class Base(DeclarativeBase):
@@ -80,6 +81,21 @@ class EducationRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class SkillRow(Base):
+    """SQLAlchemy representation of a self-declared skill."""
+
+    __tablename__ = "skills"
+
+    item_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("profiles.profile_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    level: Mapped[str | None] = mapped_column(String(20))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 def _owned_experiences(owner: ProfileOwner) -> Select[ExperienceRow]:
     return (
         select(ExperienceRow)
@@ -95,6 +111,17 @@ def _owned_educations(owner: ProfileOwner) -> Select[EducationRow]:
     return (
         select(EducationRow)
         .join(ProfileRow, EducationRow.profile_id == ProfileRow.profile_id)
+        .where(
+            ProfileRow.tenant_id == str(owner.tenant_id),
+            ProfileRow.owner_account_id == str(owner.account_id),
+        )
+    )
+
+
+def _owned_skills(owner: ProfileOwner) -> Select[SkillRow]:
+    return (
+        select(SkillRow)
+        .join(ProfileRow, SkillRow.profile_id == ProfileRow.profile_id)
         .where(
             ProfileRow.tenant_id == str(owner.tenant_id),
             ProfileRow.owner_account_id == str(owner.account_id),
@@ -158,6 +185,20 @@ def _education(row: EducationRow) -> Education:
     )
 
 
+def _skill(row: SkillRow) -> Skill:
+    return Skill.model_validate(
+        {
+            "item_id": row.item_id,
+            "kind": "skill",
+            "name": row.name,
+            "level": row.level,
+            "level_source": "selfDeclared" if row.level is not None else None,
+            "created_at": _aware(row.created_at),
+            "updated_at": _aware(row.updated_at),
+        }
+    )
+
+
 class SqlAlchemyProfileItemReader:
     """Read all supported item kinds through one stable ordered page."""
 
@@ -189,6 +230,13 @@ class SqlAlchemyProfileItemReader:
                     .limit(ceiling)
                 )
                 items.extend(_education(row) for row in education_rows)
+            if kind in (None, "skill"):
+                skill_rows = session.scalars(
+                    _owned_skills(owner)
+                    .order_by(SkillRow.created_at, SkillRow.item_id)
+                    .limit(ceiling)
+                )
+                items.extend(_skill(row) for row in skill_rows)
         items.sort(key=lambda item: (item.created_at, str(item.item_id)))
         window = items[offset : offset + limit + 1]
         return ProfileItemSlice(items=tuple(window[:limit]), has_more=len(window) > limit)
@@ -203,7 +251,10 @@ class SqlAlchemyProfileItemReader:
             education = session.scalar(
                 _owned_educations(owner).where(EducationRow.item_id == str(item_id))
             )
-            return _education(education) if education is not None else None
+            if education is not None:
+                return _education(education)
+            skill = session.scalar(_owned_skills(owner).where(SkillRow.item_id == str(item_id)))
+            return _skill(skill) if skill is not None else None
 
 
 class SqlAlchemyExperienceRepository:
@@ -288,6 +339,44 @@ class SqlAlchemyEducationRepository:
             row = session.scalar(
                 _owned_educations(owner).where(EducationRow.item_id == str(item_id))
             )
+            if row is None:
+                return False
+            session.delete(row)
+            return True
+
+
+class SqlAlchemySkillRepository:
+    """Persist skill mutations while deriving self-declared provenance."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._sessions = sessionmaker(engine, expire_on_commit=False)
+
+    def create(self, owner: ProfileOwner, draft: SkillDraft) -> Skill:
+        with self._sessions.begin() as session:
+            now = datetime.now(UTC)
+            row = SkillRow(
+                item_id=str(uuid4()),
+                profile_id=_profile_id(session, owner),
+                created_at=now,
+                updated_at=now,
+                **draft.model_dump(exclude={"kind"}, by_alias=False),
+            )
+            session.add(row)
+        return _skill(row)
+
+    def replace(self, owner: ProfileOwner, item_id: UUID, draft: SkillDraft) -> Skill | None:
+        with self._sessions.begin() as session:
+            row = session.scalar(_owned_skills(owner).where(SkillRow.item_id == str(item_id)))
+            if row is None:
+                return None
+            for field, value in draft.model_dump(exclude={"kind"}, by_alias=False).items():
+                setattr(row, field, value)
+            row.updated_at = datetime.now(UTC)
+        return _skill(row)
+
+    def delete(self, owner: ProfileOwner, item_id: UUID) -> bool:
+        with self._sessions.begin() as session:
+            row = session.scalar(_owned_skills(owner).where(SkillRow.item_id == str(item_id)))
             if row is None:
                 return False
             session.delete(row)

@@ -12,6 +12,7 @@ from careeros_profile.application.use_cases.profile_items import (
 from careeros_profile.domain.education import Education, EducationDraft
 from careeros_profile.domain.experience import Experience, ExperienceDraft
 from careeros_profile.domain.profile_item import ProfileItemKind
+from careeros_profile.domain.skill import Skill, SkillDraft
 
 OWNER = ProfileOwner(
     account_id=UUID("20000000-0000-0000-0000-000000000001"),
@@ -69,6 +70,27 @@ class RecordingEducationRepository:
         return False
 
 
+class RecordingSkillRepository:
+    def __init__(self) -> None:
+        self.created: SkillDraft | None = None
+
+    def create(self, owner: ProfileOwner, draft: SkillDraft) -> Skill:
+        self.created = draft
+        return Skill(
+            **draft.model_dump(by_alias=False),
+            item_id=UUID("50000000-0000-0000-0000-000000000001"),
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+            updated_at=datetime(2026, 1, 1, tzinfo=UTC),
+            level_source="selfDeclared" if draft.level is not None else None,
+        )
+
+    def replace(self, owner: ProfileOwner, item_id: UUID, draft: SkillDraft) -> Skill | None:
+        return None
+
+    def delete(self, owner: ProfileOwner, item_id: UUID) -> bool:
+        return False
+
+
 def education_draft(**changes: object) -> EducationDraft:
     values: dict[str, object] = {
         "kind": "education",
@@ -84,12 +106,27 @@ def education_draft(**changes: object) -> EducationDraft:
 
 def test_use_case_dispatches_education_through_its_explicit_port() -> None:
     educations = RecordingEducationRepository()
-    use_case = ManageProfileItems(EmptyReader(), UnusedExperienceRepository(), educations)
+    use_case = ManageProfileItems(
+        EmptyReader(), UnusedExperienceRepository(), educations, RecordingSkillRepository()
+    )
 
     created = use_case.create(OWNER, education_draft())
 
     assert created.kind == "education"
     assert educations.created is not None
+
+
+def test_use_case_derives_self_declared_skill_provenance() -> None:
+    skills = RecordingSkillRepository()
+    use_case = ManageProfileItems(
+        EmptyReader(), UnusedExperienceRepository(), RecordingEducationRepository(), skills
+    )
+
+    created = use_case.create(OWNER, SkillDraft(kind="skill", name="Python", level="advanced"))
+
+    assert isinstance(created, Skill)
+    assert created.level_source == "selfDeclared"
+    assert skills.created is not None
 
 
 def test_dated_item_rules_and_cursor_fail_before_adapters() -> None:
@@ -99,7 +136,10 @@ def test_dated_item_rules_and_cursor_fail_before_adapters() -> None:
         education_draft(current=True)
 
     use_case = ManageProfileItems(
-        EmptyReader(), UnusedExperienceRepository(), RecordingEducationRepository()
+        EmptyReader(),
+        UnusedExperienceRepository(),
+        RecordingEducationRepository(),
+        RecordingSkillRepository(),
     )
     with pytest.raises(InvalidCursor):
         use_case.list(OWNER, cursor="not-a-cursor")

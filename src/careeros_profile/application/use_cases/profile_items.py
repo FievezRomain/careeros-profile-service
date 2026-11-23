@@ -10,14 +10,16 @@ from careeros_profile.application.ports.profile import (
     ProfileItemPage,
     ProfileItemReader,
     ProfileOwner,
+    SkillRepository,
 )
-from careeros_profile.domain.education import Education
+from careeros_profile.domain.education import Education, EducationDraft
 from careeros_profile.domain.experience import Experience, ExperienceDraft
 from careeros_profile.domain.profile_item import (
     ProfileItem,
     ProfileItemDraft,
     ProfileItemKind,
 )
+from careeros_profile.domain.skill import Skill
 
 
 class ProfileItemNotFound(Exception):
@@ -36,10 +38,12 @@ class ManageProfileItems:
         reader: ProfileItemReader,
         experiences: ExperienceRepository,
         educations: EducationRepository,
+        skills: SkillRepository,
     ) -> None:
         self._reader = reader
         self._experiences = experiences
         self._educations = educations
+        self._skills = skills
 
     def list(
         self,
@@ -63,25 +67,30 @@ class ManageProfileItems:
     def create(self, owner: ProfileOwner, draft: ProfileItemDraft) -> ProfileItem:
         if isinstance(draft, ExperienceDraft):
             return self._experiences.create(owner, draft)
-        return self._educations.create(owner, draft)
+        if isinstance(draft, EducationDraft):
+            return self._educations.create(owner, draft)
+        return self._skills.create(owner, draft)
 
     def replace(self, owner: ProfileOwner, item_id: UUID, draft: ProfileItemDraft) -> ProfileItem:
-        item: Experience | Education | None
+        item: Experience | Education | Skill | None
         if isinstance(draft, ExperienceDraft):
             item = self._experiences.replace(owner, item_id, draft)
-        else:
+        elif isinstance(draft, EducationDraft):
             item = self._educations.replace(owner, item_id, draft)
+        else:
+            item = self._skills.replace(owner, item_id, draft)
         if item is None:
             raise ProfileItemNotFound
         return item
 
     def delete(self, owner: ProfileOwner, item_id: UUID) -> None:
         item = self.get(owner, item_id)
-        deleted = (
-            self._experiences.delete(owner, item_id)
-            if isinstance(item, Experience)
-            else self._educations.delete(owner, item_id)
-        )
+        if isinstance(item, Experience):
+            deleted = self._experiences.delete(owner, item_id)
+        elif isinstance(item, Education):
+            deleted = self._educations.delete(owner, item_id)
+        else:
+            deleted = self._skills.delete(owner, item_id)
         if not deleted:
             raise ProfileItemNotFound
 
