@@ -1,0 +1,39 @@
+name: Profile service CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: python -m pip install uv==0.13.9
+      - run: uv sync --locked --all-groups
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run mypy src tests
+      - run: uv run pytest
+      - run: uv run pip-audit
+      - run: uv run bandit -q -r src
+      - run: uv run python -m careeros_profile.adapters.migrations.runner upgrade
+        env:
+          DATABASE_URL: sqlite+pysqlite:///./ci-profile.db
+      - run: uv run python -m careeros_profile.adapters.migrations.runner downgrade
+        env:
+          DATABASE_URL: sqlite+pysqlite:///./ci-profile.db
+      - uses: actions/checkout@v4
+        with:
+          repository: FievezRomain/careeros-workspace
+          ref: e1cf907150bcd7658da5da75b0dc977428da13ed
+          path: .careeros-workspace
+      - run: uv run python .careeros-workspace/scripts/check_service_quality.py .

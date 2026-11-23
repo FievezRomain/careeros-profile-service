@@ -1,0 +1,85 @@
+[project]
+name = "careeros-profile-service"
+version = "0.1.0"
+description = "CareerOS verified professional profile boundary"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+  "alembic>=1.17,<2",
+  "fastapi>=0.165,<0.166",
+  "psycopg[binary]>=3.3,<4",
+  "pydantic>=2.12,<3",
+  "pydantic-settings>=2.16,<3",
+  "sqlalchemy>=2.0,<3",
+  "uvicorn>=0.54,<0.55",
+]
+
+[dependency-groups]
+dev = [
+  "bandit>=1.9,<2",
+  "httpx2>=2.16,<3",
+  "mypy>=1.19,<2",
+  "pip-audit>=2.10,<3",
+  "pytest>=9.2,<10",
+  "ruff>=0.14,<0.15",
+]
+
+[build-system]
+requires = ["hatchling>=1.28,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/careeros_profile"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-config --strict-markers"
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+mypy_path = "src"
+explicit_package_bases = true
+plugins = ["pydantic.mypy"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.careeros.quality]
+package = "src/careeros_profile"
+persistence = true
+domain = "src/careeros_profile/domain"
+application = "src/careeros_profile/application"
+ports = "src/careeros_profile/application/ports"
+adapters = "src/careeros_profile/adapters"
+composition_root = "src/careeros_profile/adapters/http.py"
+migrations = "src/careeros_profile/adapters/migrations"
+migration_runner = "src/careeros_profile/adapters/migrations/runner.py"
+
+[tool.careeros.quality.commands]
+format = "uv run ruff format --check ."
+lint = "uv run ruff check ."
+type = "uv run mypy src tests"
+test = "uv run pytest"
+secret = "gitleaks detect --redact --no-banner"
+security = "uv run pip-audit && uv run bandit -q -r src"
+migrate_up = "uv run python -m careeros_profile.adapters.migrations.runner upgrade"
+migrate_down = "uv run python -m careeros_profile.adapters.migrations.runner downgrade"
+
+[tool.careeros.quality.logging]
+structured = true
+correlation = true
+redaction = true
+
+[tool.careeros.quality.evidence]
+unit = "tests/test_service.py"
+integration = "tests/test_service.py"
+contract = "tests/test_service.py"
+health = "tests/test_service.py"
+logging = "tests/test_service.py"
+security = "tests/test_service.py"
+migrations = "tests/test_service.py"
+startup_migrations = "tests/test_service.py"

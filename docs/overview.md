@@ -21,6 +21,10 @@ The canonical professional profile and provenance of user-supplied facts.
 - Correlation identifiers are propagated without logging sensitive payloads.
 - Authorization and ownership are checked at the service boundary.
 
+## Architecture and startup
+
+Domain and application code depend only on core-owned ports. The HTTP composition root constructs SQLAlchemy persistence and Alembic migration adapters and injects them into application use cases. Migration configuration and revision history remain inside the migration adapter. Application startup applies all pending revisions, verifies every expected head and fails before accepting traffic when the schema cannot be brought current.
+
 ## Non-goals
 
 This service does not absorb responsibilities owned by another CareerOS service. Cross-service workflows are coordinated through explicit contracts rather than shared databases.
