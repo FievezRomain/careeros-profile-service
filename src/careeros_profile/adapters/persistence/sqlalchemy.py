@@ -1,4 +1,4 @@
-"""SQLAlchemy adapter for the Profile Service-owned database."""
+"""SQLAlchemy implementation of Profile persistence ports."""
 
 from datetime import datetime
 
@@ -6,9 +6,11 @@ from sqlalchemy import DateTime, Engine, String, create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from careeros_profile.application.ports.persistence import PersistenceHealth
+
 
 class Base(DeclarativeBase):
-    """Declarative mapping base owned by the persistence adapter."""
+    """Declarative mapping base owned by the SQLAlchemy adapter."""
 
 
 class ProfileRow(Base):
@@ -25,20 +27,20 @@ class ProfileRow(Base):
 
 
 class SqlAlchemyPersistenceProbe:
-    """Check database reachability without exposing connection details."""
+    """Check database reachability without exposing SQLAlchemy to the core."""
 
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
 
-    def is_ready(self) -> bool:
+    def check(self) -> PersistenceHealth:
         try:
             with self._engine.connect() as connection:
                 connection.execute(text("SELECT 1"))
         except SQLAlchemyError:
-            return False
-        return True
+            return PersistenceHealth(available=False)
+        return PersistenceHealth(available=True)
 
 
 def create_profile_engine(database_url: str) -> Engine:
-    """Create the engine for this service's isolated database."""
+    """Create the engine for this adapter's configured database implementation."""
     return create_engine(database_url, pool_pre_ping=True)

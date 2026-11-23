@@ -53,9 +53,11 @@ package = "src/careeros_profile"
 persistence = true
 domain = "src/careeros_profile/domain"
 application = "src/careeros_profile/application"
-ports = "src/careeros_profile/application"
+ports = "src/careeros_profile/application/ports"
 adapters = "src/careeros_profile/adapters"
 composition_root = "src/careeros_profile/adapters/http.py"
+migrations = "src/careeros_profile/adapters/migrations"
+migration_runner = "src/careeros_profile/adapters/migrations/runner.py"
 
 [tool.careeros.quality.commands]
 format = "uv run ruff format --check ."
@@ -64,8 +66,8 @@ type = "uv run mypy src tests"
 test = "uv run pytest"
 secret = "gitleaks detect --redact --no-banner"
 security = "uv run pip-audit && uv run bandit -q -r src"
-migrate_up = "uv run alembic upgrade head"
-migrate_down = "uv run alembic downgrade base"
+migrate_up = "uv run python -m careeros_profile.adapters.migrations.runner upgrade"
+migrate_down = "uv run python -m careeros_profile.adapters.migrations.runner downgrade"
 
 [tool.careeros.quality.logging]
 structured = true
@@ -80,3 +82,4 @@ health = "tests/test_service.py"
 logging = "tests/test_service.py"
 security = "tests/test_service.py"
 migrations = "tests/test_service.py"
+startup_migrations = "tests/test_service.py"

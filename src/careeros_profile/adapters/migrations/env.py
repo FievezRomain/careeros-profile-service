@@ -1,12 +1,11 @@
-"""Alembic environment for the Profile Service-owned database."""
+"""Alembic environment owned by the migration adapter."""
 
-import os
 from logging.config import fileConfig
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from careeros_profile.adapters.persistence import Base
+from careeros_profile.adapters.persistence.sqlalchemy import Base
 
 config = context.config
 if config.config_file_name is not None:
@@ -16,10 +15,9 @@ target_metadata = Base.metadata
 
 
 def database_url() -> str:
-    """Resolve the migration target without logging credentials."""
-    configured = os.getenv("DATABASE_URL") or config.get_main_option("sqlalchemy.url")
+    configured = config.get_main_option("sqlalchemy.url")
     if not configured:
-        raise RuntimeError("DATABASE_URL is required for migrations")
+        raise RuntimeError("the migration adapter requires a database URL")
     return configured
 
 

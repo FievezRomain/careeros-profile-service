@@ -25,10 +25,10 @@ jobs:
       - run: uv run pytest
       - run: uv run pip-audit
       - run: uv run bandit -q -r src
-      - run: uv run alembic upgrade head
+      - run: uv run python -m careeros_profile.adapters.migrations.runner upgrade
         env:
           DATABASE_URL: sqlite+pysqlite:///./ci-profile.db
-      - run: uv run alembic downgrade base
+      - run: uv run python -m careeros_profile.adapters.migrations.runner downgrade
         env:
           DATABASE_URL: sqlite+pysqlite:///./ci-profile.db
       - uses: actions/checkout@v4

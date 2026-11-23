@@ -13,11 +13,19 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import Engine
 from starlette.middleware.base import RequestResponseEndpoint
 
-from careeros_profile.adapters.persistence import SqlAlchemyPersistenceProbe, create_profile_engine
-from careeros_profile.application.operations import (
+from careeros_profile.adapters.migrations.runner import AlembicMigrationRunner
+from careeros_profile.adapters.persistence.sqlalchemy import (
+    SqlAlchemyPersistenceProbe,
+    create_profile_engine,
+)
+from careeros_profile.application.ports.persistence import (
+    MigrationRunner,
     PersistenceProbe,
-    health_status,
-    readiness_status,
+)
+from careeros_profile.application.use_cases.operations import (
+    GetHealth,
+    GetReadiness,
+    StartApplication,
 )
 
 CORRELATION_HEADER = "X-Correlation-ID"
@@ -57,18 +65,25 @@ def _correlation_id(request: Request) -> str:
 def create_app(
     settings: Settings | None = None,
     persistence_probe: PersistenceProbe | None = None,
+    migration_runner: MigrationRunner | None = None,
 ) -> FastAPI:
-    """Validate configuration and compose Profile Service adapters."""
+    """Compose adapters and inject them into application use cases."""
     validated_settings = settings or Settings()
     LOGGER.setLevel(validated_settings.log_level.upper())
+    database_url = validated_settings.database_url.get_secret_value()
     engine: Engine | None = None
     probe = persistence_probe
     if probe is None:
-        engine = create_profile_engine(validated_settings.database_url.get_secret_value())
+        engine = create_profile_engine(database_url)
         probe = SqlAlchemyPersistenceProbe(engine)
+    migrations = migration_runner or AlembicMigrationRunner(database_url)
+    get_health = GetHealth()
+    get_readiness = GetReadiness(probe)
+    start_application = StartApplication(migrations)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        start_application.execute()
         yield
         if engine is not None:
             engine.dispose()
@@ -104,11 +119,11 @@ def create_app(
 
     @application.get("/health", response_model=HealthResponse, tags=["operations"])
     async def health() -> HealthResponse:
-        return HealthResponse.model_validate(health_status())
+        return HealthResponse.model_validate(get_health.execute())
 
     @application.get("/ready", response_model=HealthResponse, tags=["operations"])
     def ready(response: Response) -> HealthResponse:
-        result = readiness_status(probe)
+        result = get_readiness.execute()
         if result.status == "unavailable":
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return HealthResponse.model_validate(result)

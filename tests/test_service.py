@@ -3,32 +3,47 @@ import logging
 from pathlib import Path
 
 import pytest
-from alembic import command
-from alembic.config import Config
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import create_engine, inspect
 
 from careeros_profile.adapters.http import CORRELATION_HEADER, Settings, create_app
-from careeros_profile.adapters.persistence import (
+from careeros_profile.adapters.migrations.runner import AlembicMigrationRunner
+from careeros_profile.adapters.persistence.sqlalchemy import (
     SqlAlchemyPersistenceProbe,
     create_profile_engine,
 )
+from careeros_profile.application.ports.persistence import (
+    MigrationState,
+    PersistenceHealth,
+)
+from careeros_profile.application.use_cases.operations import MigrationStateError
 
 
 class StubProbe:
     def __init__(self, ready: bool) -> None:
         self._ready = ready
 
-    def is_ready(self) -> bool:
-        return self._ready
+    def check(self) -> PersistenceHealth:
+        return PersistenceHealth(available=self._ready)
+
+
+class StubMigrationRunner:
+    def __init__(self, latest: bool = True) -> None:
+        self.calls = 0
+        self._latest = latest
+
+    def ensure_latest(self) -> MigrationState:
+        self.calls += 1
+        current = ("head",) if self._latest else ()
+        return MigrationState(current_heads=current, expected_heads=("head",))
 
 
 SETTINGS = Settings(app_env="test", log_level="info", database_url="sqlite+pysqlite:///:memory:")
 
 
-def client(ready: bool = True) -> TestClient:
-    return TestClient(create_app(SETTINGS, StubProbe(ready)))
+def client(ready: bool = True, migrations: StubMigrationRunner | None = None) -> TestClient:
+    return TestClient(create_app(SETTINGS, StubProbe(ready), migrations or StubMigrationRunner()))
 
 
 def profile_table_exists(database_url: str) -> bool:
@@ -58,10 +73,20 @@ def test_readiness_reports_owned_database_failure_without_details() -> None:
     assert "database" not in response.text.lower()
 
 
+def test_startup_injects_runner_and_rejects_incomplete_schema() -> None:
+    migrations = StubMigrationRunner()
+    with client(migrations=migrations):
+        pass
+    assert migrations.calls == 1
+
+    with pytest.raises(MigrationStateError), client(migrations=StubMigrationRunner(False)):
+        pass
+
+
 def test_persistence_probe_checks_an_isolated_database(tmp_path: Path) -> None:
     engine = create_profile_engine(f"sqlite+pysqlite:///{tmp_path / 'probe.db'}")
     try:
-        assert SqlAlchemyPersistenceProbe(engine).is_ready()
+        assert SqlAlchemyPersistenceProbe(engine).check().available
     finally:
         engine.dispose()
 
@@ -106,10 +131,9 @@ def test_openapi_documents_only_public_operational_endpoints() -> None:
 
 def test_initial_migration_applies_and_rolls_back(tmp_path: Path) -> None:
     database_url = f"sqlite+pysqlite:///{tmp_path / 'migration.db'}"
-    configuration = Config(str(Path(__file__).parents[1] / "alembic.ini"))
-    configuration.set_main_option("sqlalchemy.url", database_url)
+    migrations = AlembicMigrationRunner(database_url)
 
-    command.upgrade(configuration, "head")
+    assert migrations.ensure_latest().at_latest
     assert profile_table_exists(database_url)
-    command.downgrade(configuration, "base")
+    migrations.downgrade_base()
     assert not profile_table_exists(database_url)

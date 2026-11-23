@@ -13,3 +13,9 @@ Read README.md, docs/overview.md and SECURITY.md before changing this repository
 - Do not trigger external messages, applications or destructive actions without explicit user approval at action time.
 
 Consult the central workspace skills for architecture, contracts, events, security, testing and documentation work.
+
+## Code Review Rules
+
+- Domain and application modules may depend only on core-owned types and ports; flag imports of FastAPI, SQLAlchemy, Alembic or concrete adapters.
+- Use cases receive ports through constructor injection. Concrete engines, migration runners and adapters are created only in the composition root.
+- Migration configuration, revisions and runners belong under the migration adapter, never at repository root. Startup must apply and verify every expected migration head before serving traffic.
