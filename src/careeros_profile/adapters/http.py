@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 from fastapi import (
     Depends,
     FastAPI,
+    Header,
     HTTPException,
     Path,
     Query,
@@ -32,7 +33,9 @@ from careeros_profile.adapters.persistence.sqlalchemy import (
     SqlAlchemyEducationRepository,
     SqlAlchemyExperienceRepository,
     SqlAlchemyPersistenceProbe,
+    SqlAlchemyProfileFactRepository,
     SqlAlchemyProfileItemReader,
+    SqlAlchemyProfileSnapshotRepository,
     SqlAlchemySkillRepository,
     create_profile_engine,
 )
@@ -45,8 +48,10 @@ from careeros_profile.application.ports.persistence import MigrationRunner, Pers
 from careeros_profile.application.ports.profile import (
     EducationRepository,
     ExperienceRepository,
+    ProfileFactRepository,
     ProfileItemReader,
     ProfileOwner,
+    ProfileSnapshotRepository,
     SkillRepository,
 )
 from careeros_profile.application.use_cases.operations import (
@@ -56,14 +61,21 @@ from careeros_profile.application.use_cases.operations import (
 )
 from careeros_profile.application.use_cases.profile_items import (
     InvalidCursor,
+    InvalidFactProvenance,
     ManageProfileItems,
     ProfileItemNotFound,
+)
+from careeros_profile.application.use_cases.snapshots import (
+    IdempotencyKeyConflict,
+    ManageProfileSnapshots,
+    ProfileSnapshotNotFound,
 )
 from careeros_profile.domain.profile_item import (
     ProfileItem,
     ProfileItemDraft,
     ProfileItemKind,
 )
+from careeros_profile.domain.snapshot import ProfileSnapshot
 
 CORRELATION_HEADER = "X-Correlation-ID"
 LOGGER = logging.getLogger("careeros.profile.http")
@@ -149,6 +161,18 @@ def _http_error(status_code: int, code: str, title: str, detail: str) -> HTTPExc
     )
 
 
+def _idempotency_key(value: str) -> str:
+    valid_characters = all(character.isalnum() or character in "._:-" for character in value)
+    if not 16 <= len(value) <= 128 or not valid_characters:
+        raise _http_error(
+            400,
+            "IDEMPOTENCY_KEY_INVALID",
+            "Invalid idempotency key",
+            "Idempotency-Key must be an opaque value of 16 to 128 allowed characters.",
+        )
+    return value
+
+
 def require_account_context(
     request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Security(BEARER)],
@@ -182,6 +206,8 @@ def create_app(
     experience_repository: ExperienceRepository | None = None,
     education_repository: EducationRepository | None = None,
     skill_repository: SkillRepository | None = None,
+    profile_fact_repository: ProfileFactRepository | None = None,
+    profile_snapshot_repository: ProfileSnapshotRepository | None = None,
 ) -> FastAPI:
     """Compose concrete adapters and inject ports into application use cases."""
     validated_settings = settings or Settings()
@@ -194,6 +220,8 @@ def create_app(
         or experience_repository is None
         or education_repository is None
         or skill_repository is None
+        or profile_fact_repository is None
+        or profile_snapshot_repository is None
     ):
         engine = create_profile_engine(database_url)
     probe = persistence_probe or SqlAlchemyPersistenceProbe(cast(Engine, engine))
@@ -201,11 +229,16 @@ def create_app(
     experiences = experience_repository or SqlAlchemyExperienceRepository(cast(Engine, engine))
     educations = education_repository or SqlAlchemyEducationRepository(cast(Engine, engine))
     skills = skill_repository or SqlAlchemySkillRepository(cast(Engine, engine))
+    facts = profile_fact_repository or SqlAlchemyProfileFactRepository(cast(Engine, engine))
+    snapshots = profile_snapshot_repository or SqlAlchemyProfileSnapshotRepository(
+        cast(Engine, engine)
+    )
     migrations = migration_runner or AlembicMigrationRunner(database_url)
     get_health = GetHealth()
     get_readiness = GetReadiness(probe)
     start_application = StartApplication(migrations)
-    profile_items = ManageProfileItems(reader, experiences, educations, skills)
+    profile_items = ManageProfileItems(reader, experiences, educations, skills, facts)
+    profile_snapshots = ManageProfileSnapshots(snapshots)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -270,18 +303,29 @@ def create_app(
 
     @application.exception_handler(RequestValidationError)
     async def validation_exception_handler(
-        request: Request, _: RequestValidationError
+        request: Request, error: RequestValidationError
     ) -> JSONResponse:
+        idempotency_header_error = any(
+            issue.get("loc", ())[:1] == ("header",)
+            and str(issue.get("loc", ("",))[-1]).lower() == "idempotency-key"
+            for issue in error.errors()
+        )
+        status_code = 400 if idempotency_header_error else 422
+        code = "IDEMPOTENCY_KEY_INVALID" if idempotency_header_error else "VALIDATION_FAILED"
         problem = _problem(
             request,
-            422,
-            "VALIDATION_FAILED",
-            "Validation failed",
-            "The request does not satisfy the profile contract.",
+            status_code,
+            code,
+            "Invalid idempotency key" if idempotency_header_error else "Validation failed",
+            (
+                "Idempotency-Key must be an opaque value of 16 to 128 allowed characters."
+                if idempotency_header_error
+                else "The request does not satisfy the profile contract."
+            ),
         )
         return JSONResponse(
             problem.model_dump(by_alias=True),
-            status_code=422,
+            status_code=status_code,
             media_type="application/problem+json",
         )
 
@@ -331,7 +375,15 @@ def create_app(
     )
     def create_item(draft: ProfileItemDraft, account: Account, response: Response) -> ProfileItem:
         owner = _require_scope(account, "profile:write")
-        item = profile_items.create(owner, draft)
+        try:
+            item = profile_items.create(owner, draft)
+        except InvalidFactProvenance:
+            raise _http_error(
+                422,
+                "VALIDATION_FAILED",
+                "Validation failed",
+                "userCorrection provenance is recorded only by the service.",
+            ) from None
         response.headers["Location"] = f"/v1/profile/items/{item.item_id}"
         return item
 
@@ -362,6 +414,13 @@ def create_app(
         owner = _require_scope(account, "profile:write")
         try:
             return profile_items.replace(owner, item_id, draft)
+        except InvalidFactProvenance:
+            raise _http_error(
+                422,
+                "VALIDATION_FAILED",
+                "Validation failed",
+                "Replacement provenance is recorded only by the service.",
+            ) from None
         except ProfileItemNotFound:
             raise _http_error(404, "NOT_FOUND", "Not found", "Profile item not found.") from None
 
@@ -377,5 +436,71 @@ def create_app(
         except ProfileItemNotFound:
             raise _http_error(404, "NOT_FOUND", "Not found", "Profile item not found.") from None
         return Response(status_code=204)
+
+    @application.put(
+        "/v1/profile/items/{itemId}/confirmation",
+        response_model=ProfileItem,
+        response_model_exclude_none=True,
+        tags=["Profile items"],
+    )
+    def confirm_item(
+        item_id: Annotated[UUID, Path(alias="itemId")], account: Account
+    ) -> ProfileItem:
+        owner = _require_scope(account, "profile:write")
+        try:
+            return profile_items.confirm(owner, item_id)
+        except ProfileItemNotFound:
+            raise _http_error(404, "NOT_FOUND", "Not found", "Profile item not found.") from None
+
+    @application.post(
+        "/v1/profile/snapshots",
+        response_model=ProfileSnapshot,
+        response_model_exclude_none=True,
+        status_code=201,
+        tags=["Profile snapshots"],
+    )
+    def create_snapshot(
+        account: Account,
+        response: Response,
+        idempotency_key: Annotated[
+            str,
+            Header(
+                alias="Idempotency-Key",
+                min_length=16,
+                max_length=128,
+                pattern=r"^[A-Za-z0-9._:-]+$",
+            ),
+        ],
+    ) -> ProfileSnapshot:
+        owner = _require_scope(account, "profile:write")
+        key = _idempotency_key(idempotency_key)
+        try:
+            snapshot = profile_snapshots.create(owner, key)
+        except IdempotencyKeyConflict:
+            raise _http_error(
+                409,
+                "IDEMPOTENCY_KEY_REUSED",
+                "Idempotency key reused",
+                "The idempotency key was already used for another request.",
+            ) from None
+        response.headers["Location"] = f"/v1/profile/snapshots/{snapshot.snapshot_id}"
+        return snapshot
+
+    @application.get(
+        "/v1/profile/snapshots/{snapshotId}",
+        response_model=ProfileSnapshot,
+        response_model_exclude_none=True,
+        tags=["Profile snapshots"],
+    )
+    def get_snapshot(
+        snapshot_id: Annotated[UUID, Path(alias="snapshotId")], account: Account
+    ) -> ProfileSnapshot:
+        owner = _require_scope(account, "profile:read")
+        try:
+            return profile_snapshots.get(owner, snapshot_id)
+        except ProfileSnapshotNotFound:
+            raise _http_error(
+                404, "NOT_FOUND", "Not found", "Profile snapshot not found."
+            ) from None
 
     return application

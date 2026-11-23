@@ -7,6 +7,7 @@ from uuid import UUID
 from pydantic import Field
 
 from careeros_profile.domain.dated_item import DatedItemDraft
+from careeros_profile.domain.fact import FactProvenance, FactValidationStatus
 
 
 class ExperienceDraft(DatedItemDraft):
@@ -22,5 +23,7 @@ class Experience(ExperienceDraft):
     """Persisted experience returned through the public boundary."""
 
     item_id: UUID
+    provenance: FactProvenance
+    validation_status: FactValidationStatus
     created_at: datetime
     updated_at: datetime

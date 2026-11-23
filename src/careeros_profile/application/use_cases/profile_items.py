@@ -7,6 +7,7 @@ from uuid import UUID
 from careeros_profile.application.ports.profile import (
     EducationRepository,
     ExperienceRepository,
+    ProfileFactRepository,
     ProfileItemPage,
     ProfileItemReader,
     ProfileOwner,
@@ -30,6 +31,10 @@ class InvalidCursor(ValueError):
     """The opaque pagination cursor is malformed."""
 
 
+class InvalidFactProvenance(ValueError):
+    """A caller attempted to forge server-recorded correction provenance."""
+
+
 class ManageProfileItems:
     """Coordinate item CRUD through explicit owner-scoped ports."""
 
@@ -39,11 +44,13 @@ class ManageProfileItems:
         experiences: ExperienceRepository,
         educations: EducationRepository,
         skills: SkillRepository,
+        facts: ProfileFactRepository,
     ) -> None:
         self._reader = reader
         self._experiences = experiences
         self._educations = educations
         self._skills = skills
+        self._facts = facts
 
     def list(
         self,
@@ -65,6 +72,8 @@ class ManageProfileItems:
         return item
 
     def create(self, owner: ProfileOwner, draft: ProfileItemDraft) -> ProfileItem:
+        if draft.provenance.origin == "userCorrection":
+            raise InvalidFactProvenance
         if isinstance(draft, ExperienceDraft):
             return self._experiences.create(owner, draft)
         if isinstance(draft, EducationDraft):
@@ -72,6 +81,8 @@ class ManageProfileItems:
         return self._skills.create(owner, draft)
 
     def replace(self, owner: ProfileOwner, item_id: UUID, draft: ProfileItemDraft) -> ProfileItem:
+        if draft.provenance.origin != "directEntry" or draft.provenance.source_id is not None:
+            raise InvalidFactProvenance
         item: Experience | Education | Skill | None
         if isinstance(draft, ExperienceDraft):
             item = self._experiences.replace(owner, item_id, draft)
@@ -79,6 +90,12 @@ class ManageProfileItems:
             item = self._educations.replace(owner, item_id, draft)
         else:
             item = self._skills.replace(owner, item_id, draft)
+        if item is None:
+            raise ProfileItemNotFound
+        return item
+
+    def confirm(self, owner: ProfileOwner, item_id: UUID) -> ProfileItem:
+        item = self._facts.confirm(owner, item_id)
         if item is None:
             raise ProfileItemNotFound
         return item
@@ -105,7 +122,7 @@ class ManageProfileItems:
         try:
             raw = urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode()
             offset = int(raw)
-        except (Base64Error, UnicodeDecodeError, ValueError):
+        except Base64Error, UnicodeDecodeError, ValueError:
             raise InvalidCursor from None
         if offset < 0 or ManageProfileItems._encode_cursor(offset) != cursor:
             raise InvalidCursor

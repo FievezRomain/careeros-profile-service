@@ -138,7 +138,20 @@ def test_openapi_documents_operational_and_versioned_profile_endpoints() -> None
         "/ready",
         "/v1/profile/items",
         "/v1/profile/items/{itemId}",
+        "/v1/profile/items/{itemId}/confirmation",
+        "/v1/profile/snapshots",
+        "/v1/profile/snapshots/{snapshotId}",
     }
+    confirmation = document["paths"]["/v1/profile/items/{itemId}/confirmation"]["put"]
+    create_snapshot = document["paths"]["/v1/profile/snapshots"]["post"]
+    assert confirmation["responses"]["200"]["content"]["application/json"]["schema"]
+    assert create_snapshot["responses"]["201"]["content"]["application/json"]["schema"]
+    idempotency_header = next(
+        parameter
+        for parameter in create_snapshot["parameters"]
+        if parameter["name"] == "Idempotency-Key"
+    )
+    assert idempotency_header["required"] is True
 
 
 def test_migrations_apply_and_roll_back_all_adapter_owned_tables(tmp_path: Path) -> None:
@@ -146,8 +159,15 @@ def test_migrations_apply_and_roll_back_all_adapter_owned_tables(tmp_path: Path)
     migrations = AlembicMigrationRunner(database_url)
 
     assert migrations.ensure_latest().at_latest
-    assert {"alembic_version", "profiles", "experiences", "educations", "skills"} <= tables(
-        database_url
-    )
+    owned_tables = {
+        "alembic_version",
+        "profiles",
+        "experiences",
+        "educations",
+        "skills",
+        "profile_snapshots",
+        "snapshot_idempotency",
+    }
+    assert owned_tables <= tables(database_url)
     migrations.downgrade_base()
-    assert not ({"profiles", "experiences", "educations", "skills"} & tables(database_url))
+    assert not (owned_tables - {"alembic_version"}) & tables(database_url)

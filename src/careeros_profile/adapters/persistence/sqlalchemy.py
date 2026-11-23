@@ -4,6 +4,7 @@ from datetime import UTC, date, datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     Date,
     DateTime,
@@ -15,15 +16,21 @@ from sqlalchemy import (
     select,
     text,
 )
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from careeros_profile.application.ports.persistence import PersistenceHealth
-from careeros_profile.application.ports.profile import ProfileItemSlice, ProfileOwner
+from careeros_profile.application.ports.profile import (
+    ProfileItemSlice,
+    ProfileOwner,
+    SnapshotCreationResult,
+)
 from careeros_profile.domain.education import Education, EducationDraft
 from careeros_profile.domain.experience import Experience, ExperienceDraft
+from careeros_profile.domain.fact import initial_validation_status
 from careeros_profile.domain.profile_item import ProfileItem, ProfileItemKind
 from careeros_profile.domain.skill import Skill, SkillDraft
+from careeros_profile.domain.snapshot import ProfileSnapshot
 
 
 class Base(DeclarativeBase):
@@ -58,6 +65,12 @@ class ExperienceRow(Base):
     start_date: Mapped[date] = mapped_column(Date, nullable=False)
     end_date: Mapped[date | None] = mapped_column(Date)
     current: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    provenance_origin: Mapped[str] = mapped_column(String(32), nullable=False)
+    provenance_source_id: Mapped[str | None] = mapped_column(String(200))
+    provenance_recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    validation_status: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
@@ -77,6 +90,12 @@ class EducationRow(Base):
     start_date: Mapped[date] = mapped_column(Date, nullable=False)
     end_date: Mapped[date | None] = mapped_column(Date)
     current: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    provenance_origin: Mapped[str] = mapped_column(String(32), nullable=False)
+    provenance_source_id: Mapped[str | None] = mapped_column(String(200))
+    provenance_recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    validation_status: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
@@ -92,8 +111,43 @@ class SkillRow(Base):
     )
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     level: Mapped[str | None] = mapped_column(String(20))
+    provenance_origin: Mapped[str] = mapped_column(String(32), nullable=False)
+    provenance_source_id: Mapped[str | None] = mapped_column(String(200))
+    provenance_recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    validation_status: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ProfileSnapshotRow(Base):
+    """Immutable serialized view of all facts owned at one point in time."""
+
+    __tablename__ = "profile_snapshots"
+
+    snapshot_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("profiles.profile_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    items_payload: Mapped[list[dict[str, object]]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SnapshotIdempotencyRow(Base):
+    """Durable command outcome scoped to one owned profile."""
+
+    __tablename__ = "snapshot_idempotency"
+
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("profiles.profile_id", ondelete="CASCADE"), primary_key=True
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("profile_snapshots.snapshot_id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 def _owned_experiences(owner: ProfileOwner) -> Select[ExperienceRow]:
@@ -129,6 +183,17 @@ def _owned_skills(owner: ProfileOwner) -> Select[SkillRow]:
     )
 
 
+def _owned_snapshots(owner: ProfileOwner) -> Select[ProfileSnapshotRow]:
+    return (
+        select(ProfileSnapshotRow)
+        .join(ProfileRow, ProfileSnapshotRow.profile_id == ProfileRow.profile_id)
+        .where(
+            ProfileRow.tenant_id == str(owner.tenant_id),
+            ProfileRow.owner_account_id == str(owner.account_id),
+        )
+    )
+
+
 def _profile_id(session: Session, owner: ProfileOwner) -> str:
     profile = session.scalar(
         select(ProfileRow).where(
@@ -151,6 +216,39 @@ def _aware(value: datetime) -> datetime:
     return value.replace(tzinfo=value.tzinfo or UTC)
 
 
+def _fact_fields(row: ExperienceRow | EducationRow | SkillRow) -> dict[str, object]:
+    provenance: dict[str, object] = {
+        "origin": row.provenance_origin,
+        "recorded_at": _aware(row.provenance_recorded_at),
+    }
+    if row.provenance_source_id is not None:
+        provenance["source_id"] = row.provenance_source_id
+    return {
+        "provenance": provenance,
+        "validation_status": row.validation_status,
+    }
+
+
+def _initial_fact_values(
+    draft: ExperienceDraft | EducationDraft | SkillDraft, now: datetime
+) -> dict[str, object]:
+    return {
+        "provenance_origin": draft.provenance.origin,
+        "provenance_source_id": draft.provenance.source_id,
+        "provenance_recorded_at": now,
+        "validation_status": initial_validation_status(draft.provenance.origin),
+    }
+
+
+def _mark_user_correction(
+    row: ExperienceRow | EducationRow | SkillRow, item_id: UUID, now: datetime
+) -> None:
+    row.provenance_origin = "userCorrection"
+    row.provenance_source_id = str(item_id)
+    row.provenance_recorded_at = now
+    row.validation_status = "userConfirmed"
+
+
 def _experience(row: ExperienceRow) -> Experience:
     return Experience.model_validate(
         {
@@ -162,6 +260,7 @@ def _experience(row: ExperienceRow) -> Experience:
             "start_date": row.start_date,
             "end_date": row.end_date,
             "current": row.current,
+            **_fact_fields(row),
             "created_at": _aware(row.created_at),
             "updated_at": _aware(row.updated_at),
         }
@@ -179,6 +278,7 @@ def _education(row: EducationRow) -> Education:
             "start_date": row.start_date,
             "end_date": row.end_date,
             "current": row.current,
+            **_fact_fields(row),
             "created_at": _aware(row.created_at),
             "updated_at": _aware(row.updated_at),
         }
@@ -193,10 +293,52 @@ def _skill(row: SkillRow) -> Skill:
             "name": row.name,
             "level": row.level,
             "level_source": "selfDeclared" if row.level is not None else None,
+            **_fact_fields(row),
             "created_at": _aware(row.created_at),
             "updated_at": _aware(row.updated_at),
         }
     )
+
+
+def _all_items(session: Session, owner: ProfileOwner) -> list[ProfileItem]:
+    items: list[ProfileItem] = []
+    items.extend(_experience(row) for row in session.scalars(_owned_experiences(owner)))
+    items.extend(_education(row) for row in session.scalars(_owned_educations(owner)))
+    items.extend(_skill(row) for row in session.scalars(_owned_skills(owner)))
+    items.sort(key=lambda item: (item.created_at, str(item.item_id)))
+    return items
+
+
+def _snapshot(row: ProfileSnapshotRow) -> ProfileSnapshot:
+    return ProfileSnapshot.model_validate(
+        {
+            "snapshot_id": row.snapshot_id,
+            "created_at": _aware(row.created_at),
+            "items": row.items_payload,
+        }
+    )
+
+
+def _owned_fact_row(
+    session: Session, owner: ProfileOwner, item_id: UUID
+) -> ExperienceRow | EducationRow | SkillRow | None:
+    experience = session.scalar(
+        _owned_experiences(owner).where(ExperienceRow.item_id == str(item_id))
+    )
+    if experience is not None:
+        return experience
+    education = session.scalar(_owned_educations(owner).where(EducationRow.item_id == str(item_id)))
+    if education is not None:
+        return education
+    return session.scalar(_owned_skills(owner).where(SkillRow.item_id == str(item_id)))
+
+
+def _profile_item(row: ExperienceRow | EducationRow | SkillRow) -> ProfileItem:
+    if isinstance(row, ExperienceRow):
+        return _experience(row)
+    if isinstance(row, EducationRow):
+        return _education(row)
+    return _skill(row)
 
 
 class SqlAlchemyProfileItemReader:
@@ -271,7 +413,8 @@ class SqlAlchemyExperienceRepository:
                 profile_id=_profile_id(session, owner),
                 created_at=now,
                 updated_at=now,
-                **draft.model_dump(exclude={"kind"}, by_alias=False),
+                **_initial_fact_values(draft, now),
+                **draft.model_dump(exclude={"kind", "provenance"}, by_alias=False),
             )
             session.add(row)
         return _experience(row)
@@ -285,9 +428,13 @@ class SqlAlchemyExperienceRepository:
             )
             if row is None:
                 return None
-            for field, value in draft.model_dump(exclude={"kind"}, by_alias=False).items():
+            for field, value in draft.model_dump(
+                exclude={"kind", "provenance"}, by_alias=False
+            ).items():
                 setattr(row, field, value)
-            row.updated_at = datetime.now(UTC)
+            now = datetime.now(UTC)
+            _mark_user_correction(row, item_id, now)
+            row.updated_at = now
         return _experience(row)
 
     def delete(self, owner: ProfileOwner, item_id: UUID) -> bool:
@@ -315,7 +462,8 @@ class SqlAlchemyEducationRepository:
                 profile_id=_profile_id(session, owner),
                 created_at=now,
                 updated_at=now,
-                **draft.model_dump(exclude={"kind"}, by_alias=False),
+                **_initial_fact_values(draft, now),
+                **draft.model_dump(exclude={"kind", "provenance"}, by_alias=False),
             )
             session.add(row)
         return _education(row)
@@ -329,9 +477,13 @@ class SqlAlchemyEducationRepository:
             )
             if row is None:
                 return None
-            for field, value in draft.model_dump(exclude={"kind"}, by_alias=False).items():
+            for field, value in draft.model_dump(
+                exclude={"kind", "provenance"}, by_alias=False
+            ).items():
                 setattr(row, field, value)
-            row.updated_at = datetime.now(UTC)
+            now = datetime.now(UTC)
+            _mark_user_correction(row, item_id, now)
+            row.updated_at = now
         return _education(row)
 
     def delete(self, owner: ProfileOwner, item_id: UUID) -> bool:
@@ -359,7 +511,8 @@ class SqlAlchemySkillRepository:
                 profile_id=_profile_id(session, owner),
                 created_at=now,
                 updated_at=now,
-                **draft.model_dump(exclude={"kind"}, by_alias=False),
+                **_initial_fact_values(draft, now),
+                **draft.model_dump(exclude={"kind", "provenance"}, by_alias=False),
             )
             session.add(row)
         return _skill(row)
@@ -369,9 +522,13 @@ class SqlAlchemySkillRepository:
             row = session.scalar(_owned_skills(owner).where(SkillRow.item_id == str(item_id)))
             if row is None:
                 return None
-            for field, value in draft.model_dump(exclude={"kind"}, by_alias=False).items():
+            for field, value in draft.model_dump(
+                exclude={"kind", "provenance"}, by_alias=False
+            ).items():
                 setattr(row, field, value)
-            row.updated_at = datetime.now(UTC)
+            now = datetime.now(UTC)
+            _mark_user_correction(row, item_id, now)
+            row.updated_at = now
         return _skill(row)
 
     def delete(self, owner: ProfileOwner, item_id: UUID) -> bool:
@@ -381,6 +538,121 @@ class SqlAlchemySkillRepository:
                 return False
             session.delete(row)
             return True
+
+
+class SqlAlchemyProfileFactRepository:
+    """Apply mutations shared by all fact kinds inside the owner scope."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._sessions = sessionmaker(engine, expire_on_commit=False)
+
+    def confirm(self, owner: ProfileOwner, item_id: UUID) -> ProfileItem | None:
+        with self._sessions.begin() as session:
+            row = _owned_fact_row(session, owner, item_id)
+            if row is None:
+                return None
+            if row.validation_status != "userConfirmed":
+                row.validation_status = "userConfirmed"
+                row.updated_at = datetime.now(UTC)
+        return _profile_item(row)
+
+
+class SqlAlchemyProfileSnapshotRepository:
+    """Atomically capture and replay immutable owner-scoped snapshots."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._sessions = sessionmaker(engine, expire_on_commit=False)
+
+    def create(
+        self,
+        owner: ProfileOwner,
+        *,
+        idempotency_key: str,
+        request_fingerprint: str,
+    ) -> SnapshotCreationResult:
+        try:
+            return self._create(owner, idempotency_key, request_fingerprint)
+        except IntegrityError:
+            return self._replay_after_concurrent_insert(
+                owner,
+                idempotency_key=idempotency_key,
+                request_fingerprint=request_fingerprint,
+            )
+
+    def _create(
+        self, owner: ProfileOwner, idempotency_key: str, request_fingerprint: str
+    ) -> SnapshotCreationResult:
+        with self._sessions.begin() as session:
+            profile_id = _profile_id(session, owner)
+            existing = session.get(SnapshotIdempotencyRow, (profile_id, idempotency_key))
+            if existing is not None:
+                return self._existing_result(session, existing, request_fingerprint)
+
+            now = datetime.now(UTC)
+            snapshot_row = ProfileSnapshotRow(
+                snapshot_id=str(uuid4()),
+                profile_id=profile_id,
+                items_payload=[
+                    item.model_dump(mode="json", by_alias=False)
+                    for item in _all_items(session, owner)
+                ],
+                created_at=now,
+            )
+            session.add(snapshot_row)
+            session.add(
+                SnapshotIdempotencyRow(
+                    profile_id=profile_id,
+                    idempotency_key=idempotency_key,
+                    request_fingerprint=request_fingerprint,
+                    snapshot_id=snapshot_row.snapshot_id,
+                    created_at=now,
+                )
+            )
+        return SnapshotCreationResult(outcome="created", snapshot=_snapshot(snapshot_row))
+
+    def _replay_after_concurrent_insert(
+        self,
+        owner: ProfileOwner,
+        *,
+        idempotency_key: str,
+        request_fingerprint: str,
+    ) -> SnapshotCreationResult:
+        with self._sessions() as session:
+            profile = session.scalar(
+                select(ProfileRow).where(
+                    ProfileRow.tenant_id == str(owner.tenant_id),
+                    ProfileRow.owner_account_id == str(owner.account_id),
+                )
+            )
+            if profile is None:
+                raise RuntimeError("concurrent idempotency outcome has no owned profile")
+            existing = session.get(
+                SnapshotIdempotencyRow,
+                (profile.profile_id, idempotency_key),
+            )
+            if existing is None:
+                raise RuntimeError("concurrent idempotency outcome was not persisted")
+            return self._existing_result(session, existing, request_fingerprint)
+
+    @staticmethod
+    def _existing_result(
+        session: Session,
+        existing: SnapshotIdempotencyRow,
+        request_fingerprint: str,
+    ) -> SnapshotCreationResult:
+        if existing.request_fingerprint != request_fingerprint:
+            return SnapshotCreationResult(outcome="conflict")
+        snapshot_row = session.get(ProfileSnapshotRow, existing.snapshot_id)
+        if snapshot_row is None:
+            raise RuntimeError("idempotency outcome references a missing snapshot")
+        return SnapshotCreationResult(outcome="replayed", snapshot=_snapshot(snapshot_row))
+
+    def get(self, owner: ProfileOwner, snapshot_id: UUID) -> ProfileSnapshot | None:
+        with self._sessions() as session:
+            row = session.scalar(
+                _owned_snapshots(owner).where(ProfileSnapshotRow.snapshot_id == str(snapshot_id))
+            )
+            return _snapshot(row) if row is not None else None
 
 
 class SqlAlchemyPersistenceProbe:

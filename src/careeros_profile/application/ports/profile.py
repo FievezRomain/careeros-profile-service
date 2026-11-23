@@ -1,6 +1,6 @@
 """Technology-neutral profile persistence capabilities."""
 
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
@@ -9,6 +9,7 @@ from careeros_profile.domain.education import Education, EducationDraft
 from careeros_profile.domain.experience import Experience, ExperienceDraft
 from careeros_profile.domain.profile_item import ProfileItem, ProfileItemKind
 from careeros_profile.domain.skill import Skill, SkillDraft
+from careeros_profile.domain.snapshot import ProfileSnapshot
 
 
 class ProfileOwner(BaseModel):
@@ -42,6 +43,12 @@ class ProfileItemReader(Protocol):
     ) -> ProfileItemSlice: ...
 
     def get(self, owner: ProfileOwner, item_id: UUID) -> ProfileItem | None: ...
+
+
+class ProfileFactRepository(Protocol):
+    """Outbound port for mutations shared by every material fact kind."""
+
+    def confirm(self, owner: ProfileOwner, item_id: UUID) -> ProfileItem | None: ...
 
 
 class ExperienceRepository(Protocol):
@@ -85,3 +92,26 @@ class ProfileItemPage(BaseModel):
 
     items: tuple[ProfileItem, ...]
     next_cursor: str | None = None
+
+
+class SnapshotCreationResult(BaseModel):
+    """Adapter-neutral result of an idempotent snapshot command."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    outcome: Literal["created", "replayed", "conflict"]
+    snapshot: ProfileSnapshot | None = None
+
+
+class ProfileSnapshotRepository(Protocol):
+    """Outbound port for atomic, owner-scoped immutable snapshots."""
+
+    def create(
+        self,
+        owner: ProfileOwner,
+        *,
+        idempotency_key: str,
+        request_fingerprint: str,
+    ) -> SnapshotCreationResult: ...
+
+    def get(self, owner: ProfileOwner, snapshot_id: UUID) -> ProfileSnapshot | None: ...
