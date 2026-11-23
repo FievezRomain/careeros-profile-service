@@ -81,8 +81,6 @@ class ManageProfileItems:
         return self._skills.create(owner, draft)
 
     def replace(self, owner: ProfileOwner, item_id: UUID, draft: ProfileItemDraft) -> ProfileItem:
-        if draft.provenance.origin != "directEntry" or draft.provenance.source_id is not None:
-            raise InvalidFactProvenance
         item: Experience | Education | Skill | None
         if isinstance(draft, ExperienceDraft):
             item = self._experiences.replace(owner, item_id, draft)

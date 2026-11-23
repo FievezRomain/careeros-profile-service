@@ -84,9 +84,14 @@ def test_derived_fact_requires_owner_confirmation_and_records_correction(tmp_pat
         )
         assert replayed_confirmation.json() == confirmed.json()
 
+        correction_payload = experience_payload("Senior Platform Engineer")
+        correction_payload["provenance"] = {
+            "origin": "resumeImport",
+            "sourceId": "untrusted-replacement-source",
+        }
         corrected = client.put(
             f"/v1/profile/items/{item['itemId']}",
-            json=experience_payload("Senior Platform Engineer"),
+            json=correction_payload,
             headers=headers(),
         )
         assert corrected.status_code == 200
