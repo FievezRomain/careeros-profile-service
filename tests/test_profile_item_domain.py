@@ -11,6 +11,7 @@ from careeros_profile.application.use_cases.profile_items import (
 )
 from careeros_profile.domain.education import Education, EducationDraft
 from careeros_profile.domain.experience import Experience, ExperienceDraft
+from careeros_profile.domain.fact import FactProvenance, initial_validation_status
 from careeros_profile.domain.profile_item import ProfileItemKind
 from careeros_profile.domain.skill import Skill, SkillDraft
 
@@ -35,6 +36,18 @@ class EmptyReader:
         return None
 
 
+class UnusedFactRepository:
+    def confirm(self, owner: ProfileOwner, item_id: UUID) -> None:
+        return None
+
+
+def persisted_provenance(draft: EducationDraft | SkillDraft) -> FactProvenance:
+    return FactProvenance(
+        **draft.provenance.model_dump(by_alias=False),
+        recorded_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
 class UnusedExperienceRepository:
     def create(self, owner: ProfileOwner, draft: ExperienceDraft) -> Experience:
         raise AssertionError("education must not use the experience repository")
@@ -55,8 +68,10 @@ class RecordingEducationRepository:
     def create(self, owner: ProfileOwner, draft: EducationDraft) -> Education:
         self.created = draft
         return Education(
-            **draft.model_dump(by_alias=False),
+            **draft.model_dump(exclude={"provenance"}, by_alias=False),
             item_id=UUID("40000000-0000-0000-0000-000000000001"),
+            provenance=persisted_provenance(draft),
+            validation_status=initial_validation_status(draft.provenance.origin),
             created_at=datetime(2026, 1, 1, tzinfo=UTC),
             updated_at=datetime(2026, 1, 1, tzinfo=UTC),
         )
@@ -77,8 +92,10 @@ class RecordingSkillRepository:
     def create(self, owner: ProfileOwner, draft: SkillDraft) -> Skill:
         self.created = draft
         return Skill(
-            **draft.model_dump(by_alias=False),
+            **draft.model_dump(exclude={"provenance"}, by_alias=False),
             item_id=UUID("50000000-0000-0000-0000-000000000001"),
+            provenance=persisted_provenance(draft),
+            validation_status=initial_validation_status(draft.provenance.origin),
             created_at=datetime(2026, 1, 1, tzinfo=UTC),
             updated_at=datetime(2026, 1, 1, tzinfo=UTC),
             level_source="selfDeclared" if draft.level is not None else None,
@@ -107,7 +124,11 @@ def education_draft(**changes: object) -> EducationDraft:
 def test_use_case_dispatches_education_through_its_explicit_port() -> None:
     educations = RecordingEducationRepository()
     use_case = ManageProfileItems(
-        EmptyReader(), UnusedExperienceRepository(), educations, RecordingSkillRepository()
+        EmptyReader(),
+        UnusedExperienceRepository(),
+        educations,
+        RecordingSkillRepository(),
+        UnusedFactRepository(),
     )
 
     created = use_case.create(OWNER, education_draft())
@@ -119,7 +140,11 @@ def test_use_case_dispatches_education_through_its_explicit_port() -> None:
 def test_use_case_derives_self_declared_skill_provenance() -> None:
     skills = RecordingSkillRepository()
     use_case = ManageProfileItems(
-        EmptyReader(), UnusedExperienceRepository(), RecordingEducationRepository(), skills
+        EmptyReader(),
+        UnusedExperienceRepository(),
+        RecordingEducationRepository(),
+        skills,
+        UnusedFactRepository(),
     )
 
     created = use_case.create(OWNER, SkillDraft(kind="skill", name="Python", level="advanced"))
@@ -140,6 +165,7 @@ def test_dated_item_rules_and_cursor_fail_before_adapters() -> None:
         UnusedExperienceRepository(),
         RecordingEducationRepository(),
         RecordingSkillRepository(),
+        UnusedFactRepository(),
     )
     with pytest.raises(InvalidCursor):
         use_case.list(OWNER, cursor="not-a-cursor")

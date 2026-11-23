@@ -6,6 +6,12 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from careeros_profile.domain.fact import (
+    FactProvenance,
+    FactProvenanceInput,
+    FactValidationStatus,
+)
+
 SkillLevel = Literal["beginner", "intermediate", "advanced", "expert"]
 
 
@@ -29,12 +35,15 @@ class SkillDraft(BaseModel):
     kind: Literal["skill"]
     name: str = Field(min_length=1, max_length=120)
     level: SkillLevel | None = None
+    provenance: FactProvenanceInput = Field(default_factory=FactProvenanceInput)
 
 
 class Skill(SkillDraft):
     """Persisted skill whose optional level is explicitly self-declared."""
 
     item_id: UUID
+    provenance: FactProvenance
+    validation_status: FactValidationStatus
     created_at: datetime
     updated_at: datetime
     level_source: Literal["selfDeclared"] | None = None

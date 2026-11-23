@@ -3,7 +3,9 @@
 from datetime import date
 from typing import Self
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from careeros_profile.domain.fact import FactProvenanceInput
 
 
 def _to_camel(value: str) -> str:
@@ -26,6 +28,7 @@ class DatedItemDraft(BaseModel):
     start_date: date
     end_date: date | None = None
     current: bool
+    provenance: FactProvenanceInput = Field(default_factory=FactProvenanceInput)
 
     @model_validator(mode="after")
     def validate_dates(self) -> Self:

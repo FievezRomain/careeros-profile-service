@@ -58,5 +58,5 @@ class JwtTokenVerifier:
                     "scopes": scopes,
                 }
             )
-        except (PyJWTError, ValidationError, TypeError):
+        except PyJWTError, ValidationError, TypeError:
             raise TokenValidationError from None
