@@ -146,6 +146,6 @@ def test_migrations_apply_and_roll_back_all_adapter_owned_tables(tmp_path: Path)
     migrations = AlembicMigrationRunner(database_url)
 
     assert migrations.ensure_latest().at_latest
-    assert {"alembic_version", "profiles", "experiences"} <= tables(database_url)
+    assert {"alembic_version", "profiles", "experiences", "educations"} <= tables(database_url)
     migrations.downgrade_base()
-    assert not ({"profiles", "experiences"} & tables(database_url))
+    assert not ({"profiles", "experiences", "educations"} & tables(database_url))

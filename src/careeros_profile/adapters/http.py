@@ -29,8 +29,10 @@ from starlette.middleware.base import RequestResponseEndpoint
 from careeros_profile.adapters.auth import JwtTokenVerifier, SigningKeyResolver
 from careeros_profile.adapters.migrations.runner import AlembicMigrationRunner
 from careeros_profile.adapters.persistence.sqlalchemy import (
+    SqlAlchemyEducationRepository,
     SqlAlchemyExperienceRepository,
     SqlAlchemyPersistenceProbe,
+    SqlAlchemyProfileItemReader,
     create_profile_engine,
 )
 from careeros_profile.application.ports.authentication import (
@@ -39,18 +41,27 @@ from careeros_profile.application.ports.authentication import (
     TokenVerifier,
 )
 from careeros_profile.application.ports.persistence import MigrationRunner, PersistenceProbe
-from careeros_profile.application.ports.profile import ExperienceRepository, ProfileOwner
-from careeros_profile.application.use_cases.experiences import (
-    InvalidCursor,
-    ManageExperiences,
-    ProfileItemNotFound,
+from careeros_profile.application.ports.profile import (
+    EducationRepository,
+    ExperienceRepository,
+    ProfileItemReader,
+    ProfileOwner,
 )
 from careeros_profile.application.use_cases.operations import (
     GetHealth,
     GetReadiness,
     StartApplication,
 )
-from careeros_profile.domain.experience import Experience, ExperienceDraft
+from careeros_profile.application.use_cases.profile_items import (
+    InvalidCursor,
+    ManageProfileItems,
+    ProfileItemNotFound,
+)
+from careeros_profile.domain.profile_item import (
+    ProfileItem,
+    ProfileItemDraft,
+    ProfileItemKind,
+)
 
 CORRELATION_HEADER = "X-Correlation-ID"
 LOGGER = logging.getLogger("careeros.profile.http")
@@ -85,10 +96,10 @@ class PageMetadata(BaseModel):
     next_cursor: str | None = Field(default=None, serialization_alias="nextCursor")
 
 
-class ExperiencePageResponse(BaseModel):
+class ProfileItemPageResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    items: tuple[Experience, ...]
+    items: tuple[ProfileItem, ...]
     page: PageMetadata
 
 
@@ -165,22 +176,31 @@ def create_app(
     persistence_probe: PersistenceProbe | None = None,
     migration_runner: MigrationRunner | None = None,
     token_verifier: TokenVerifier | None = None,
+    profile_item_reader: ProfileItemReader | None = None,
     experience_repository: ExperienceRepository | None = None,
+    education_repository: EducationRepository | None = None,
 ) -> FastAPI:
     """Compose concrete adapters and inject ports into application use cases."""
     validated_settings = settings or Settings()
     LOGGER.setLevel(validated_settings.log_level.upper())
     database_url = validated_settings.database_url.get_secret_value()
     engine: Engine | None = None
-    if persistence_probe is None or experience_repository is None:
+    if (
+        persistence_probe is None
+        or profile_item_reader is None
+        or experience_repository is None
+        or education_repository is None
+    ):
         engine = create_profile_engine(database_url)
     probe = persistence_probe or SqlAlchemyPersistenceProbe(cast(Engine, engine))
-    repository = experience_repository or SqlAlchemyExperienceRepository(cast(Engine, engine))
+    reader = profile_item_reader or SqlAlchemyProfileItemReader(cast(Engine, engine))
+    experiences = experience_repository or SqlAlchemyExperienceRepository(cast(Engine, engine))
+    educations = education_repository or SqlAlchemyEducationRepository(cast(Engine, engine))
     migrations = migration_runner or AlembicMigrationRunner(database_url)
     get_health = GetHealth()
     get_readiness = GetReadiness(probe)
     start_application = StartApplication(migrations)
-    experiences = ManageExperiences(repository)
+    profile_items = ManageProfileItems(reader, experiences, educations)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -275,68 +295,68 @@ def create_app(
 
     @application.get(
         "/v1/profile/items",
-        response_model=ExperiencePageResponse,
+        response_model=ProfileItemPageResponse,
         response_model_exclude_none=True,
         tags=["Profile items"],
     )
     def list_items(
         account: Account,
-        kind: Literal["experience", "education", "skill"] | None = None,
+        kind: ProfileItemKind | None = None,
         page_size: Annotated[int, Query(alias="pageSize", ge=1, le=100)] = 25,
         cursor: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
-    ) -> ExperiencePageResponse:
+    ) -> ProfileItemPageResponse:
         owner = _require_scope(account, "profile:read")
-        if kind not in (None, "experience"):
-            return ExperiencePageResponse(items=(), page=PageMetadata())
         try:
-            result = experiences.list(owner, page_size=page_size, cursor=cursor)
+            result = profile_items.list(owner, page_size=page_size, cursor=cursor, kind=kind)
         except InvalidCursor:
             raise _http_error(
                 422, "VALIDATION_FAILED", "Validation failed", "Invalid cursor."
             ) from None
-        return ExperiencePageResponse(
+        return ProfileItemPageResponse(
             items=result.items,
             page=PageMetadata(next_cursor=result.next_cursor),
         )
 
     @application.post(
         "/v1/profile/items",
-        response_model=Experience,
+        response_model=ProfileItem,
         response_model_exclude_none=True,
         status_code=201,
         tags=["Profile items"],
     )
-    def create_item(draft: ExperienceDraft, account: Account, response: Response) -> Experience:
+    def create_item(draft: ProfileItemDraft, account: Account, response: Response) -> ProfileItem:
         owner = _require_scope(account, "profile:write")
-        item = experiences.create(owner, draft)
+        item = profile_items.create(owner, draft)
         response.headers["Location"] = f"/v1/profile/items/{item.item_id}"
         return item
 
     @application.get(
         "/v1/profile/items/{itemId}",
-        response_model=Experience,
+        response_model=ProfileItem,
         response_model_exclude_none=True,
         tags=["Profile items"],
     )
-    def get_item(item_id: Annotated[UUID, Path(alias="itemId")], account: Account) -> Experience:
+    def get_item(item_id: Annotated[UUID, Path(alias="itemId")], account: Account) -> ProfileItem:
         owner = _require_scope(account, "profile:read")
         try:
-            return experiences.get(owner, item_id)
+            return profile_items.get(owner, item_id)
         except ProfileItemNotFound:
             raise _http_error(404, "NOT_FOUND", "Not found", "Profile item not found.") from None
 
     @application.put(
         "/v1/profile/items/{itemId}",
-        response_model=Experience,
+        response_model=ProfileItem,
         response_model_exclude_none=True,
         tags=["Profile items"],
     )
     def replace_item(
-        item_id: Annotated[UUID, Path(alias="itemId")], draft: ExperienceDraft, account: Account
-    ) -> Experience:
+        item_id: Annotated[UUID, Path(alias="itemId")],
+        draft: ProfileItemDraft,
+        account: Account,
+    ) -> ProfileItem:
         owner = _require_scope(account, "profile:write")
         try:
-            return experiences.replace(owner, item_id, draft)
+            return profile_items.replace(owner, item_id, draft)
         except ProfileItemNotFound:
             raise _http_error(404, "NOT_FOUND", "Not found", "Profile item not found.") from None
 
@@ -348,7 +368,7 @@ def create_app(
     def delete_item(item_id: Annotated[UUID, Path(alias="itemId")], account: Account) -> Response:
         owner = _require_scope(account, "profile:write")
         try:
-            experiences.delete(owner, item_id)
+            profile_items.delete(owner, item_id)
         except ProfileItemNotFound:
             raise _http_error(404, "NOT_FOUND", "Not found", "Profile item not found.") from None
         return Response(status_code=204)
