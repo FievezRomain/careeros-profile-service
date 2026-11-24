@@ -13,6 +13,10 @@ from careeros_profile.application.ports.profile import (
     ProfileOwner,
     SkillRepository,
 )
+from careeros_profile.application.use_cases.search import (
+    MatchRelevantChangeEvent,
+    MatchRelevantEvents,
+)
 from careeros_profile.domain.education import Education, EducationDraft
 from careeros_profile.domain.experience import Experience, ExperienceDraft
 from careeros_profile.domain.profile_item import (
@@ -45,12 +49,14 @@ class ManageProfileItems:
         educations: EducationRepository,
         skills: SkillRepository,
         facts: ProfileFactRepository,
+        events: MatchRelevantEvents,
     ) -> None:
         self._reader = reader
         self._experiences = experiences
         self._educations = educations
         self._skills = skills
         self._facts = facts
+        self._events = events
 
     def list(
         self,
@@ -71,43 +77,109 @@ class ManageProfileItems:
             raise ProfileItemNotFound
         return item
 
-    def create(self, owner: ProfileOwner, draft: ProfileItemDraft) -> ProfileItem:
+    def create(
+        self, owner: ProfileOwner, draft: ProfileItemDraft, *, correlation_id: str
+    ) -> ProfileItem:
         if draft.provenance.origin == "userCorrection":
             raise InvalidFactProvenance
         if isinstance(draft, ExperienceDraft):
-            return self._experiences.create(owner, draft)
-        if isinstance(draft, EducationDraft):
-            return self._educations.create(owner, draft)
-        return self._skills.create(owner, draft)
+            item: ProfileItem = self._experiences.create(
+                owner,
+                draft,
+                event=self._event(owner, ("experiences",), "created", correlation_id),
+            )
+        elif isinstance(draft, EducationDraft):
+            item = self._educations.create(owner, draft)
+        else:
+            item = self._skills.create(
+                owner,
+                draft,
+                event=self._event(owner, ("skills",), "created", correlation_id),
+            )
+        return item
 
-    def replace(self, owner: ProfileOwner, item_id: UUID, draft: ProfileItemDraft) -> ProfileItem:
+    def replace(
+        self,
+        owner: ProfileOwner,
+        item_id: UUID,
+        draft: ProfileItemDraft,
+        *,
+        correlation_id: str,
+    ) -> ProfileItem:
         item: Experience | Education | Skill | None
         if isinstance(draft, ExperienceDraft):
-            item = self._experiences.replace(owner, item_id, draft)
+            item = self._experiences.replace(
+                owner,
+                item_id,
+                draft,
+                event=self._event(owner, ("experiences",), "replaced", correlation_id, item_id),
+            )
         elif isinstance(draft, EducationDraft):
             item = self._educations.replace(owner, item_id, draft)
         else:
-            item = self._skills.replace(owner, item_id, draft)
+            item = self._skills.replace(
+                owner,
+                item_id,
+                draft,
+                event=self._event(owner, ("skills",), "replaced", correlation_id, item_id),
+            )
         if item is None:
             raise ProfileItemNotFound
         return item
 
-    def confirm(self, owner: ProfileOwner, item_id: UUID) -> ProfileItem:
-        item = self._facts.confirm(owner, item_id)
+    def confirm(self, owner: ProfileOwner, item_id: UUID, *, correlation_id: str) -> ProfileItem:
+        current = self.get(owner, item_id)
+        event = self._event_for_item(owner, current, "confirmed", correlation_id)
+        item = self._facts.confirm(owner, item_id, event=event)
         if item is None:
             raise ProfileItemNotFound
         return item
 
-    def delete(self, owner: ProfileOwner, item_id: UUID) -> None:
+    def delete(self, owner: ProfileOwner, item_id: UUID, *, correlation_id: str) -> None:
         item = self.get(owner, item_id)
         if isinstance(item, Experience):
-            deleted = self._experiences.delete(owner, item_id)
+            deleted = self._experiences.delete(
+                owner,
+                item_id,
+                event=self._event_for_item(owner, item, "deleted", correlation_id),
+            )
         elif isinstance(item, Education):
             deleted = self._educations.delete(owner, item_id)
         else:
-            deleted = self._skills.delete(owner, item_id)
+            deleted = self._skills.delete(
+                owner,
+                item_id,
+                event=self._event_for_item(owner, item, "deleted", correlation_id),
+            )
         if not deleted:
             raise ProfileItemNotFound
+
+    def _event_for_item(
+        self, owner: ProfileOwner, item: ProfileItem, action: str, correlation_id: str
+    ) -> MatchRelevantChangeEvent | None:
+        if isinstance(item, Experience):
+            changed_fields = ("experiences",)
+        elif isinstance(item, Skill):
+            changed_fields = ("skills",)
+        else:
+            return None
+        return self._event(owner, changed_fields, action, correlation_id, item.item_id)
+
+    def _event(
+        self,
+        owner: ProfileOwner,
+        changed_fields: tuple[str, ...],
+        action: str,
+        correlation_id: str,
+        item_id: UUID | None = None,
+    ) -> MatchRelevantChangeEvent:
+        subject = str(item_id) if item_id is not None else "new"
+        return self._events.build(
+            owner,
+            changed_fields=changed_fields,
+            correlation_id=correlation_id,
+            idempotency_key=f"profile-item:{subject}:{action}:{correlation_id}",
+        )
 
     @staticmethod
     def _encode_cursor(offset: int) -> str:

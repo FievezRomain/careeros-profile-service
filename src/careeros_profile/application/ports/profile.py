@@ -1,6 +1,9 @@
 """Technology-neutral profile persistence capabilities."""
 
-from typing import Literal, Protocol
+from __future__ import annotations
+
+from datetime import datetime
+from typing import TYPE_CHECKING, Literal, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
@@ -10,6 +13,13 @@ from careeros_profile.domain.experience import Experience, ExperienceDraft
 from careeros_profile.domain.profile_item import ProfileItem, ProfileItemKind
 from careeros_profile.domain.skill import Skill, SkillDraft
 from careeros_profile.domain.snapshot import ProfileSnapshot
+
+if TYPE_CHECKING:
+    from careeros_profile.application.use_cases.search import (
+        MatchRelevantChangeEvent,
+        SearchCriteriaSnapshot,
+        SearchCriteriaWriteResult,
+    )
 
 
 class ProfileOwner(BaseModel):
@@ -48,41 +58,100 @@ class ProfileItemReader(Protocol):
 class ProfileFactRepository(Protocol):
     """Outbound port for mutations shared by every material fact kind."""
 
-    def confirm(self, owner: ProfileOwner, item_id: UUID) -> ProfileItem | None: ...
+    def confirm(
+        self,
+        owner: ProfileOwner,
+        item_id: UUID,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
+    ) -> ProfileItem | None: ...
 
 
 class ExperienceRepository(Protocol):
     """Outbound port for owner-scoped experience mutations."""
 
-    def create(self, owner: ProfileOwner, draft: ExperienceDraft) -> Experience: ...
+    def create(
+        self,
+        owner: ProfileOwner,
+        draft: ExperienceDraft,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
+    ) -> Experience: ...
 
     def replace(
-        self, owner: ProfileOwner, item_id: UUID, draft: ExperienceDraft
+        self,
+        owner: ProfileOwner,
+        item_id: UUID,
+        draft: ExperienceDraft,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
     ) -> Experience | None: ...
 
-    def delete(self, owner: ProfileOwner, item_id: UUID) -> bool: ...
+    def delete(
+        self,
+        owner: ProfileOwner,
+        item_id: UUID,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
+    ) -> bool: ...
 
 
 class EducationRepository(Protocol):
     """Outbound port for owner-scoped education mutations."""
 
-    def create(self, owner: ProfileOwner, draft: EducationDraft) -> Education: ...
+    def create(
+        self,
+        owner: ProfileOwner,
+        draft: EducationDraft,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
+    ) -> Education: ...
 
     def replace(
-        self, owner: ProfileOwner, item_id: UUID, draft: EducationDraft
+        self,
+        owner: ProfileOwner,
+        item_id: UUID,
+        draft: EducationDraft,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
     ) -> Education | None: ...
 
-    def delete(self, owner: ProfileOwner, item_id: UUID) -> bool: ...
+    def delete(
+        self,
+        owner: ProfileOwner,
+        item_id: UUID,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
+    ) -> bool: ...
 
 
 class SkillRepository(Protocol):
     """Outbound port for owner-scoped skill mutations."""
 
-    def create(self, owner: ProfileOwner, draft: SkillDraft) -> Skill: ...
+    def create(
+        self,
+        owner: ProfileOwner,
+        draft: SkillDraft,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
+    ) -> Skill: ...
 
-    def replace(self, owner: ProfileOwner, item_id: UUID, draft: SkillDraft) -> Skill | None: ...
+    def replace(
+        self,
+        owner: ProfileOwner,
+        item_id: UUID,
+        draft: SkillDraft,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
+    ) -> Skill | None: ...
 
-    def delete(self, owner: ProfileOwner, item_id: UUID) -> bool: ...
+    def delete(
+        self,
+        owner: ProfileOwner,
+        item_id: UUID,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
+    ) -> bool: ...
 
 
 class ProfileItemPage(BaseModel):
@@ -115,3 +184,27 @@ class ProfileSnapshotRepository(Protocol):
     ) -> SnapshotCreationResult: ...
 
     def get(self, owner: ProfileOwner, snapshot_id: UUID) -> ProfileSnapshot | None: ...
+
+
+class Clock(Protocol):
+    def now(self) -> datetime: ...
+
+
+class IdentifierFactory(Protocol):
+    def new(self) -> UUID: ...
+
+
+class SearchCriteriaRepository(Protocol):
+    def write(
+        self,
+        owner: ProfileOwner,
+        snapshot: SearchCriteriaSnapshot,
+        event: MatchRelevantChangeEvent,
+        *,
+        idempotency_key: str,
+        request_fingerprint: str,
+    ) -> SearchCriteriaWriteResult: ...
+
+    def current(self, owner: ProfileOwner) -> SearchCriteriaSnapshot | None: ...
+
+    def get(self, owner: ProfileOwner, version_id: UUID) -> SearchCriteriaSnapshot | None: ...

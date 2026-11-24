@@ -141,6 +141,9 @@ def test_openapi_documents_operational_and_versioned_profile_endpoints() -> None
         "/v1/profile/items/{itemId}/confirmation",
         "/v1/profile/snapshots",
         "/v1/profile/snapshots/{snapshotId}",
+        "/v1/profile/search-criteria",
+        "/v1/profile/search-criteria/{action}",
+        "/v1/profile/search-criteria/versions/{versionId}",
     }
     confirmation = document["paths"]["/v1/profile/items/{itemId}/confirmation"]["put"]
     create_snapshot = document["paths"]["/v1/profile/snapshots"]["post"]
@@ -167,6 +170,8 @@ def test_migrations_apply_and_roll_back_all_adapter_owned_tables(tmp_path: Path)
         "skills",
         "profile_snapshots",
         "snapshot_idempotency",
+        "search_criteria_versions",
+        "profile_outbox_events",
     }
     assert owned_tables <= tables(database_url)
     migrations.downgrade_base()
