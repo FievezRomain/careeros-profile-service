@@ -4,6 +4,7 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Annotated, Literal, cast
 from uuid import UUID, uuid4
 
@@ -36,6 +37,7 @@ from careeros_profile.adapters.persistence.sqlalchemy import (
     SqlAlchemyProfileFactRepository,
     SqlAlchemyProfileItemReader,
     SqlAlchemyProfileSnapshotRepository,
+    SqlAlchemySearchCriteriaRepository,
     SqlAlchemySkillRepository,
     create_profile_engine,
 )
@@ -46,12 +48,15 @@ from careeros_profile.application.ports.authentication import (
 )
 from careeros_profile.application.ports.persistence import MigrationRunner, PersistenceProbe
 from careeros_profile.application.ports.profile import (
+    Clock,
     EducationRepository,
     ExperienceRepository,
+    IdentifierFactory,
     ProfileFactRepository,
     ProfileItemReader,
     ProfileOwner,
     ProfileSnapshotRepository,
+    SearchCriteriaRepository,
     SkillRepository,
 )
 from careeros_profile.application.use_cases.operations import (
@@ -64,6 +69,14 @@ from careeros_profile.application.use_cases.profile_items import (
     InvalidFactProvenance,
     ManageProfileItems,
     ProfileItemNotFound,
+)
+from careeros_profile.application.use_cases.search import (
+    ManageSearchCriteria,
+    MatchRelevantEvents,
+    SearchCriteriaDraft,
+    SearchCriteriaIdempotencyConflict,
+    SearchCriteriaNotFound,
+    SearchCriteriaSnapshot,
 )
 from careeros_profile.application.use_cases.snapshots import (
     IdempotencyKeyConflict,
@@ -80,6 +93,16 @@ from careeros_profile.domain.snapshot import ProfileSnapshot
 CORRELATION_HEADER = "X-Correlation-ID"
 LOGGER = logging.getLogger("careeros.profile.http")
 BEARER = HTTPBearer(auto_error=False)
+
+
+class SystemClock:
+    def now(self) -> datetime:
+        return datetime.now(UTC)
+
+
+class UuidIdentifiers:
+    def new(self) -> UUID:
+        return uuid4()
 
 
 class Settings(BaseSettings):
@@ -208,6 +231,9 @@ def create_app(
     skill_repository: SkillRepository | None = None,
     profile_fact_repository: ProfileFactRepository | None = None,
     profile_snapshot_repository: ProfileSnapshotRepository | None = None,
+    search_criteria_repository: SearchCriteriaRepository | None = None,
+    clock: Clock | None = None,
+    identifiers: IdentifierFactory | None = None,
 ) -> FastAPI:
     """Compose concrete adapters and inject ports into application use cases."""
     validated_settings = settings or Settings()
@@ -222,6 +248,7 @@ def create_app(
         or skill_repository is None
         or profile_fact_repository is None
         or profile_snapshot_repository is None
+        or search_criteria_repository is None
     ):
         engine = create_profile_engine(database_url)
     probe = persistence_probe or SqlAlchemyPersistenceProbe(cast(Engine, engine))
@@ -233,12 +260,21 @@ def create_app(
     snapshots = profile_snapshot_repository or SqlAlchemyProfileSnapshotRepository(
         cast(Engine, engine)
     )
+    search_repository = search_criteria_repository or SqlAlchemySearchCriteriaRepository(
+        cast(Engine, engine)
+    )
+    event_clock = clock or SystemClock()
+    event_identifiers = identifiers or UuidIdentifiers()
     migrations = migration_runner or AlembicMigrationRunner(database_url)
     get_health = GetHealth()
     get_readiness = GetReadiness(probe)
     start_application = StartApplication(migrations)
-    profile_items = ManageProfileItems(reader, experiences, educations, skills, facts)
+    match_events = MatchRelevantEvents(event_clock, event_identifiers)
+    profile_items = ManageProfileItems(reader, experiences, educations, skills, facts, match_events)
     profile_snapshots = ManageProfileSnapshots(snapshots)
+    search_criteria = ManageSearchCriteria(
+        search_repository, match_events, event_clock, event_identifiers
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -373,10 +409,15 @@ def create_app(
         status_code=201,
         tags=["Profile items"],
     )
-    def create_item(draft: ProfileItemDraft, account: Account, response: Response) -> ProfileItem:
+    def create_item(
+        draft: ProfileItemDraft,
+        account: Account,
+        response: Response,
+        request: Request,
+    ) -> ProfileItem:
         owner = _require_scope(account, "profile:write")
         try:
-            item = profile_items.create(owner, draft)
+            item = profile_items.create(owner, draft, correlation_id=request.state.correlation_id)
         except InvalidFactProvenance:
             raise _http_error(
                 422,
@@ -410,10 +451,13 @@ def create_app(
         item_id: Annotated[UUID, Path(alias="itemId")],
         draft: ProfileItemDraft,
         account: Account,
+        request: Request,
     ) -> ProfileItem:
         owner = _require_scope(account, "profile:write")
         try:
-            return profile_items.replace(owner, item_id, draft)
+            return profile_items.replace(
+                owner, item_id, draft, correlation_id=request.state.correlation_id
+            )
         except InvalidFactProvenance:
             raise _http_error(
                 422,
@@ -429,10 +473,14 @@ def create_app(
         status_code=204,
         tags=["Profile items"],
     )
-    def delete_item(item_id: Annotated[UUID, Path(alias="itemId")], account: Account) -> Response:
+    def delete_item(
+        item_id: Annotated[UUID, Path(alias="itemId")],
+        account: Account,
+        request: Request,
+    ) -> Response:
         owner = _require_scope(account, "profile:write")
         try:
-            profile_items.delete(owner, item_id)
+            profile_items.delete(owner, item_id, correlation_id=request.state.correlation_id)
         except ProfileItemNotFound:
             raise _http_error(404, "NOT_FOUND", "Not found", "Profile item not found.") from None
         return Response(status_code=204)
@@ -444,11 +492,15 @@ def create_app(
         tags=["Profile items"],
     )
     def confirm_item(
-        item_id: Annotated[UUID, Path(alias="itemId")], account: Account
+        item_id: Annotated[UUID, Path(alias="itemId")],
+        account: Account,
+        request: Request,
     ) -> ProfileItem:
         owner = _require_scope(account, "profile:write")
         try:
-            return profile_items.confirm(owner, item_id)
+            return profile_items.confirm(
+                owner, item_id, correlation_id=request.state.correlation_id
+            )
         except ProfileItemNotFound:
             raise _http_error(404, "NOT_FOUND", "Not found", "Profile item not found.") from None
 
@@ -502,5 +554,104 @@ def create_app(
             raise _http_error(
                 404, "NOT_FOUND", "Not found", "Profile snapshot not found."
             ) from None
+
+    @application.put(
+        "/v1/profile/search-criteria",
+        response_model=SearchCriteriaSnapshot,
+        tags=["Active search"],
+    )
+    def update_search_criteria(
+        draft: SearchCriteriaDraft,
+        account: Account,
+        request: Request,
+        idempotency_key: Annotated[
+            str,
+            Header(
+                alias="Idempotency-Key",
+                min_length=16,
+                max_length=128,
+                pattern=r"^[A-Za-z0-9._:-]+$",
+            ),
+        ],
+    ) -> SearchCriteriaSnapshot:
+        owner = _require_scope(account, "profile:write")
+        try:
+            return search_criteria.update(
+                owner,
+                draft,
+                idempotency_key=_idempotency_key(idempotency_key),
+                correlation_id=request.state.correlation_id,
+            )
+        except SearchCriteriaIdempotencyConflict:
+            raise _http_error(
+                409,
+                "IDEMPOTENCY_KEY_REUSED",
+                "Idempotency key reused",
+                "The idempotency key was already used for another request.",
+            ) from None
+
+    @application.post(
+        "/v1/profile/search-criteria/{action}",
+        response_model=SearchCriteriaSnapshot,
+        tags=["Active search"],
+    )
+    def transition_search_criteria(
+        action: Literal["pause", "resume"],
+        account: Account,
+        request: Request,
+        idempotency_key: Annotated[
+            str,
+            Header(
+                alias="Idempotency-Key",
+                min_length=16,
+                max_length=128,
+                pattern=r"^[A-Za-z0-9._:-]+$",
+            ),
+        ],
+    ) -> SearchCriteriaSnapshot:
+        owner = _require_scope(account, "profile:write")
+        try:
+            return search_criteria.transition(
+                owner,
+                "paused" if action == "pause" else "active",
+                idempotency_key=_idempotency_key(idempotency_key),
+                correlation_id=request.state.correlation_id,
+            )
+        except SearchCriteriaNotFound:
+            raise _http_error(404, "NOT_FOUND", "Not found", "Search criteria not found.") from None
+        except SearchCriteriaIdempotencyConflict:
+            raise _http_error(
+                409,
+                "IDEMPOTENCY_KEY_REUSED",
+                "Idempotency key reused",
+                "The idempotency key was already used for another request.",
+            ) from None
+
+    @application.get(
+        "/v1/profile/search-criteria",
+        response_model=SearchCriteriaSnapshot,
+        tags=["Active search"],
+    )
+    def get_current_search_criteria(account: Account) -> SearchCriteriaSnapshot:
+        owner = _require_scope(account, "profile:read")
+        try:
+            return search_criteria.current(owner)
+        except SearchCriteriaNotFound:
+            raise _http_error(404, "NOT_FOUND", "Not found", "Search criteria not found.") from None
+
+    @application.get(
+        "/v1/profile/search-criteria/versions/{versionId}",
+        response_model=SearchCriteriaSnapshot,
+        tags=["Active search"],
+    )
+    def get_search_criteria_version(
+        version_id: Annotated[UUID, Path(alias="versionId")],
+        account: Account,
+    ) -> SearchCriteriaSnapshot:
+        owner = _require_scope(account, "profile:read")
+        try:
+            return search_criteria.get(owner, version_id)
+        except SearchCriteriaNotFound:
+            raise _http_error(404, "NOT_FOUND", "Not found", "Search criteria not found.") from None
 
     return application

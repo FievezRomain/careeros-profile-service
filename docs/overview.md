@@ -35,6 +35,11 @@ OIDC verification is an inbound adapter behind the application-owned `TokenVerif
 - Every item includes a provenance origin, optional source reference, server timestamp and validation status. Direct entry starts user-confirmed; imported and generated facts require explicit owner confirmation.
 - `PUT /v1/profile/items/{itemId}/confirmation` idempotently marks an owned fact as user-confirmed. `PUT` replacement records `userCorrection` provenance server-side.
 - `POST /v1/profile/snapshots` atomically creates or replays an immutable point-in-time profile using the required idempotency key. `GET /v1/profile/snapshots/{snapshotId}` reads only an owned snapshot.
+- `PUT /v1/profile/search-criteria` activates an owned daily search with target roles, locations, remote policy, contract types, exclusions, threshold, IANA timezone and explicit daily window. `POST` pause/resume transitions create further immutable versions.
+- `GET /v1/profile/search-criteria` returns the current owned version, and `GET /v1/profile/search-criteria/versions/{versionId}` preserves owner-scoped historical versions.
+- Search mutations require an idempotency key and enqueue `profile.match-relevant-change.v1` with its event ID, schema version, correlation ID and minimum provider-neutral signature.
+- Retrieval signatures normalize only roles, locations, remote policy, contract types and exclusions. They contain no threshold, contact data or raw profile facts, and only identical signature hashes are shareable.
+- Experience, skill and search-criteria changes enqueue match-relevant events in the same database transaction as the owned mutation. Contact-only and presentation-only dimensions are deliberately excluded by the deterministic change policy.
 - `profile:read` protects reads and `profile:write` protects mutations.
 - Authentication, authorization, validation and concealed ownership failures use stable problem responses without token or payload details.
 - Optional skill levels are exposed only with the derived level source `selfDeclared`; callers cannot claim certification or server-recorded correction provenance.

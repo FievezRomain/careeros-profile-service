@@ -10,8 +10,10 @@ from sqlalchemy import (
     DateTime,
     Engine,
     ForeignKey,
+    Integer,
     Select,
     String,
+    UniqueConstraint,
     create_engine,
     select,
     text,
@@ -24,6 +26,11 @@ from careeros_profile.application.ports.profile import (
     ProfileItemSlice,
     ProfileOwner,
     SnapshotCreationResult,
+)
+from careeros_profile.application.use_cases.search import (
+    MatchRelevantChangeEvent,
+    SearchCriteriaSnapshot,
+    SearchCriteriaWriteResult,
 )
 from careeros_profile.domain.education import Education, EducationDraft
 from careeros_profile.domain.experience import Experience, ExperienceDraft
@@ -150,6 +157,57 @@ class SnapshotIdempotencyRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class SearchCriteriaRow(Base):
+    """Immutable owned active-search criteria version."""
+
+    __tablename__ = "search_criteria_versions"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "version"),
+        UniqueConstraint("profile_id", "idempotency_key"),
+    )
+
+    version_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("profiles.profile_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    signature_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    snapshot_payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ProfileOutboxEventRow(Base):
+    """Durable minimum-data integration event pending relay."""
+
+    __tablename__ = "profile_outbox_events"
+    __table_args__ = (UniqueConstraint("profile_id", "idempotency_key"),)
+
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("profiles.profile_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    correlation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+def _outbox_event_row(profile_id: str, event: MatchRelevantChangeEvent) -> ProfileOutboxEventRow:
+    return ProfileOutboxEventRow(
+        event_id=str(event.event_id),
+        profile_id=profile_id,
+        event_type=event.event_type,
+        idempotency_key=event.idempotency_key,
+        correlation_id=event.correlation_id,
+        payload=event.model_dump(mode="json", by_alias=True, exclude_none=True),
+        occurred_at=event.occurred_at,
+    )
+
+
 def _owned_experiences(owner: ProfileOwner) -> Select[ExperienceRow]:
     return (
         select(ExperienceRow)
@@ -187,6 +245,17 @@ def _owned_snapshots(owner: ProfileOwner) -> Select[ProfileSnapshotRow]:
     return (
         select(ProfileSnapshotRow)
         .join(ProfileRow, ProfileSnapshotRow.profile_id == ProfileRow.profile_id)
+        .where(
+            ProfileRow.tenant_id == str(owner.tenant_id),
+            ProfileRow.owner_account_id == str(owner.account_id),
+        )
+    )
+
+
+def _owned_search_criteria(owner: ProfileOwner) -> Select[SearchCriteriaRow]:
+    return (
+        select(SearchCriteriaRow)
+        .join(ProfileRow, SearchCriteriaRow.profile_id == ProfileRow.profile_id)
         .where(
             ProfileRow.tenant_id == str(owner.tenant_id),
             ProfileRow.owner_account_id == str(owner.account_id),
@@ -319,6 +388,10 @@ def _snapshot(row: ProfileSnapshotRow) -> ProfileSnapshot:
     )
 
 
+def _search_criteria(row: SearchCriteriaRow) -> SearchCriteriaSnapshot:
+    return SearchCriteriaSnapshot.model_validate(row.snapshot_payload)
+
+
 def _owned_fact_row(
     session: Session, owner: ProfileOwner, item_id: UUID
 ) -> ExperienceRow | EducationRow | SkillRow | None:
@@ -405,22 +478,36 @@ class SqlAlchemyExperienceRepository:
     def __init__(self, engine: Engine) -> None:
         self._sessions = sessionmaker(engine, expire_on_commit=False)
 
-    def create(self, owner: ProfileOwner, draft: ExperienceDraft) -> Experience:
+    def create(
+        self,
+        owner: ProfileOwner,
+        draft: ExperienceDraft,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
+    ) -> Experience:
         with self._sessions.begin() as session:
             now = datetime.now(UTC)
+            profile_id = _profile_id(session, owner)
             row = ExperienceRow(
                 item_id=str(uuid4()),
-                profile_id=_profile_id(session, owner),
+                profile_id=profile_id,
                 created_at=now,
                 updated_at=now,
                 **_initial_fact_values(draft, now),
                 **draft.model_dump(exclude={"kind", "provenance"}, by_alias=False),
             )
             session.add(row)
+            if event is not None:
+                session.add(_outbox_event_row(profile_id, event))
         return _experience(row)
 
     def replace(
-        self, owner: ProfileOwner, item_id: UUID, draft: ExperienceDraft
+        self,
+        owner: ProfileOwner,
+        item_id: UUID,
+        draft: ExperienceDraft,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
     ) -> Experience | None:
         with self._sessions.begin() as session:
             row = session.scalar(
@@ -435,15 +522,25 @@ class SqlAlchemyExperienceRepository:
             now = datetime.now(UTC)
             _mark_user_correction(row, item_id, now)
             row.updated_at = now
+            if event is not None:
+                session.add(_outbox_event_row(row.profile_id, event))
         return _experience(row)
 
-    def delete(self, owner: ProfileOwner, item_id: UUID) -> bool:
+    def delete(
+        self,
+        owner: ProfileOwner,
+        item_id: UUID,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
+    ) -> bool:
         with self._sessions.begin() as session:
             row = session.scalar(
                 _owned_experiences(owner).where(ExperienceRow.item_id == str(item_id))
             )
             if row is None:
                 return False
+            if event is not None:
+                session.add(_outbox_event_row(row.profile_id, event))
             session.delete(row)
             return True
 
@@ -454,7 +551,13 @@ class SqlAlchemyEducationRepository:
     def __init__(self, engine: Engine) -> None:
         self._sessions = sessionmaker(engine, expire_on_commit=False)
 
-    def create(self, owner: ProfileOwner, draft: EducationDraft) -> Education:
+    def create(
+        self,
+        owner: ProfileOwner,
+        draft: EducationDraft,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
+    ) -> Education:
         with self._sessions.begin() as session:
             now = datetime.now(UTC)
             row = EducationRow(
@@ -466,10 +569,17 @@ class SqlAlchemyEducationRepository:
                 **draft.model_dump(exclude={"kind", "provenance"}, by_alias=False),
             )
             session.add(row)
+            if event is not None:
+                session.add(_outbox_event_row(row.profile_id, event))
         return _education(row)
 
     def replace(
-        self, owner: ProfileOwner, item_id: UUID, draft: EducationDraft
+        self,
+        owner: ProfileOwner,
+        item_id: UUID,
+        draft: EducationDraft,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
     ) -> Education | None:
         with self._sessions.begin() as session:
             row = session.scalar(
@@ -484,15 +594,25 @@ class SqlAlchemyEducationRepository:
             now = datetime.now(UTC)
             _mark_user_correction(row, item_id, now)
             row.updated_at = now
+            if event is not None:
+                session.add(_outbox_event_row(row.profile_id, event))
         return _education(row)
 
-    def delete(self, owner: ProfileOwner, item_id: UUID) -> bool:
+    def delete(
+        self,
+        owner: ProfileOwner,
+        item_id: UUID,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
+    ) -> bool:
         with self._sessions.begin() as session:
             row = session.scalar(
                 _owned_educations(owner).where(EducationRow.item_id == str(item_id))
             )
             if row is None:
                 return False
+            if event is not None:
+                session.add(_outbox_event_row(row.profile_id, event))
             session.delete(row)
             return True
 
@@ -503,7 +623,13 @@ class SqlAlchemySkillRepository:
     def __init__(self, engine: Engine) -> None:
         self._sessions = sessionmaker(engine, expire_on_commit=False)
 
-    def create(self, owner: ProfileOwner, draft: SkillDraft) -> Skill:
+    def create(
+        self,
+        owner: ProfileOwner,
+        draft: SkillDraft,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
+    ) -> Skill:
         with self._sessions.begin() as session:
             now = datetime.now(UTC)
             row = SkillRow(
@@ -515,9 +641,18 @@ class SqlAlchemySkillRepository:
                 **draft.model_dump(exclude={"kind", "provenance"}, by_alias=False),
             )
             session.add(row)
+            if event is not None:
+                session.add(_outbox_event_row(row.profile_id, event))
         return _skill(row)
 
-    def replace(self, owner: ProfileOwner, item_id: UUID, draft: SkillDraft) -> Skill | None:
+    def replace(
+        self,
+        owner: ProfileOwner,
+        item_id: UUID,
+        draft: SkillDraft,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
+    ) -> Skill | None:
         with self._sessions.begin() as session:
             row = session.scalar(_owned_skills(owner).where(SkillRow.item_id == str(item_id)))
             if row is None:
@@ -529,13 +664,23 @@ class SqlAlchemySkillRepository:
             now = datetime.now(UTC)
             _mark_user_correction(row, item_id, now)
             row.updated_at = now
+            if event is not None:
+                session.add(_outbox_event_row(row.profile_id, event))
         return _skill(row)
 
-    def delete(self, owner: ProfileOwner, item_id: UUID) -> bool:
+    def delete(
+        self,
+        owner: ProfileOwner,
+        item_id: UUID,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
+    ) -> bool:
         with self._sessions.begin() as session:
             row = session.scalar(_owned_skills(owner).where(SkillRow.item_id == str(item_id)))
             if row is None:
                 return False
+            if event is not None:
+                session.add(_outbox_event_row(row.profile_id, event))
             session.delete(row)
             return True
 
@@ -546,7 +691,13 @@ class SqlAlchemyProfileFactRepository:
     def __init__(self, engine: Engine) -> None:
         self._sessions = sessionmaker(engine, expire_on_commit=False)
 
-    def confirm(self, owner: ProfileOwner, item_id: UUID) -> ProfileItem | None:
+    def confirm(
+        self,
+        owner: ProfileOwner,
+        item_id: UUID,
+        *,
+        event: MatchRelevantChangeEvent | None = None,
+    ) -> ProfileItem | None:
         with self._sessions.begin() as session:
             row = _owned_fact_row(session, owner, item_id)
             if row is None:
@@ -554,6 +705,8 @@ class SqlAlchemyProfileFactRepository:
             if row.validation_status != "userConfirmed":
                 row.validation_status = "userConfirmed"
                 row.updated_at = datetime.now(UTC)
+            if event is not None:
+                session.add(_outbox_event_row(row.profile_id, event))
         return _profile_item(row)
 
 
@@ -653,6 +806,102 @@ class SqlAlchemyProfileSnapshotRepository:
                 _owned_snapshots(owner).where(ProfileSnapshotRow.snapshot_id == str(snapshot_id))
             )
             return _snapshot(row) if row is not None else None
+
+
+class SqlAlchemySearchCriteriaRepository:
+    """Persist criteria versions and match-relevant events through one owned adapter."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._sessions = sessionmaker(engine, expire_on_commit=False)
+
+    def write(
+        self,
+        owner: ProfileOwner,
+        snapshot: SearchCriteriaSnapshot,
+        event: MatchRelevantChangeEvent,
+        *,
+        idempotency_key: str,
+        request_fingerprint: str,
+    ) -> SearchCriteriaWriteResult:
+        try:
+            return self._write(owner, snapshot, event, idempotency_key, request_fingerprint)
+        except IntegrityError:
+            existing = self._idempotent_result(owner, idempotency_key, request_fingerprint)
+            if existing is not None:
+                return existing
+            return self._write(owner, snapshot, event, idempotency_key, request_fingerprint)
+
+    def _write(
+        self,
+        owner: ProfileOwner,
+        snapshot: SearchCriteriaSnapshot,
+        event: MatchRelevantChangeEvent,
+        idempotency_key: str,
+        request_fingerprint: str,
+    ) -> SearchCriteriaWriteResult:
+        with self._sessions.begin() as session:
+            profile_id = _profile_id(session, owner)
+            session.get(ProfileRow, profile_id, with_for_update=True)
+            existing = session.scalar(
+                _owned_search_criteria(owner).where(
+                    SearchCriteriaRow.idempotency_key == idempotency_key
+                )
+            )
+            if existing is not None:
+                return self._existing(existing, request_fingerprint)
+            latest_version = session.scalar(
+                select(SearchCriteriaRow.version)
+                .where(SearchCriteriaRow.profile_id == profile_id)
+                .order_by(SearchCriteriaRow.version.desc())
+                .limit(1)
+            )
+            effective = snapshot.model_copy(update={"version": (latest_version or 0) + 1})
+            row = SearchCriteriaRow(
+                version_id=str(effective.criteria_version_id),
+                profile_id=profile_id,
+                version=effective.version,
+                state=effective.state,
+                signature_id=effective.search_signature.signature_id,
+                snapshot_payload=effective.model_dump(mode="json", by_alias=True),
+                idempotency_key=idempotency_key,
+                request_fingerprint=request_fingerprint,
+                created_at=effective.created_at,
+            )
+            session.add(row)
+            session.flush()
+            session.add(_outbox_event_row(profile_id, event))
+        return SearchCriteriaWriteResult(outcome="created", snapshot=effective)
+
+    def _idempotent_result(
+        self, owner: ProfileOwner, idempotency_key: str, request_fingerprint: str
+    ) -> SearchCriteriaWriteResult | None:
+        with self._sessions() as session:
+            row = session.scalar(
+                _owned_search_criteria(owner).where(
+                    SearchCriteriaRow.idempotency_key == idempotency_key
+                )
+            )
+            return self._existing(row, request_fingerprint) if row is not None else None
+
+    @staticmethod
+    def _existing(row: SearchCriteriaRow, request_fingerprint: str) -> SearchCriteriaWriteResult:
+        if row.request_fingerprint != request_fingerprint:
+            return SearchCriteriaWriteResult(outcome="conflict")
+        return SearchCriteriaWriteResult(outcome="replayed", snapshot=_search_criteria(row))
+
+    def current(self, owner: ProfileOwner) -> SearchCriteriaSnapshot | None:
+        with self._sessions() as session:
+            row = session.scalar(
+                _owned_search_criteria(owner).order_by(SearchCriteriaRow.version.desc()).limit(1)
+            )
+            return _search_criteria(row) if row is not None else None
+
+    def get(self, owner: ProfileOwner, version_id: UUID) -> SearchCriteriaSnapshot | None:
+        with self._sessions() as session:
+            row = session.scalar(
+                _owned_search_criteria(owner).where(SearchCriteriaRow.version_id == str(version_id))
+            )
+            return _search_criteria(row) if row is not None else None
 
 
 class SqlAlchemyPersistenceProbe:
